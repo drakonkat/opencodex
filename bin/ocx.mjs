@@ -304,15 +304,13 @@ function runNpmSelfUpdate() {
       res = { status: 1 };
     }
   } catch (error) {
-    // Transactional machinery itself failed (e.g. exotic install layout): legacy path.
-    console.warn(`opencodex: transactional update unavailable (${error?.message ?? error}); falling back to in-place npm install.`);
-    console.log(`$ npm install -g ${PKG}@${tag}`);
-    res = spawnSync(installInvocation.file, installInvocation.args, {
-      stdio: "inherit",
-      timeout: 180000,
-      windowsHide: true,
-      ...installInvocation.options,
-    });
+    // An unexpected throw means we cannot prove the live tree is untouched, so the
+    // legacy in-place install (which deletes live first) is exactly the wrong rescue —
+    // it recreates the #1849 destruction path. Report and stop; the boot probe and the
+    // recovery marker cover the swap-window states.
+    console.error(`opencodex: transactional update failed unexpectedly (${error?.message ?? error}). ` +
+      "The live install was not knowingly modified; run 'ocx update' again or reinstall with npm install -g.");
+    res = { status: 1 };
   }
   if (res.status === 0) {
     console.log(`\nUpdated${latest ? ` to v${latest}` : ""}.`);

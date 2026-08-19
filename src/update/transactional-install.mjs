@@ -39,6 +39,16 @@ export function verifyInstallTree(packageDir, expectedVersion) {
   } catch {
     failures.push("bin/ocx.mjs absent");
   }
+  // The bundled Bun binary is the load-bearing artifact: without it the launcher exits
+  // before serving anything, and a boot probe that called this tree healthy would reap
+  // the only backup (review High 3). Size-gate the real binary, not just its package.json.
+  const bunPkgDir = join(packageDir, "node_modules", "bun");
+  if (existsSync(bunPkgDir)) {
+    const bunBinary = findLargestFile(bunPkgDir);
+    if (!bunBinary || bunBinary.size < 10 * 1024 * 1024) {
+      failures.push("bundled Bun binary missing or truncated (< 10MB)");
+    }
+  }
   // Sentinel direct deps: each must have an intact package.json. The bundled Bun dep is
   // the load-bearing one — without it the launcher cannot start the proxy at all.
   const deps = Object.keys(pkg.dependencies ?? {});
@@ -54,6 +64,42 @@ export function verifyInstallTree(packageDir, expectedVersion) {
 
 function stampedName(prefix) {
   return prefix + "-" + new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+/** Largest regular file under a directory tree (bounded depth) — locates the Bun binary. */
+function findLargestFile(root, depth = 3) {
+  let best;
+  let names = [];
+  try { names = readdirSync(root); } catch { return undefined; }
+  for (const name of names) {
+    const full = join(root, name);
+    let st;
+    try { st = statSync(full); } catch { continue; }
+    if (st.isFile()) {
+      if (!best || st.size > best.size) best = { path: full, size: st.size };
+    } else if (st.isDirectory() && depth > 0) {
+      const sub = findLargestFile(full, depth - 1);
+      if (sub && (!best || sub.size > best.size)) best = sub;
+    }
+  }
+  return best;
+}
+
+/** Bounded Windows-class rename retry: EPERM/EBUSY/EACCES from AV/indexers clears in ms. */
+function renameWithRetry(rename, from, to, attempts = 5) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      rename(from, to);
+      return;
+    } catch (error) {
+      const code = error?.code;
+      const retryable = code === "EPERM" || code === "EBUSY" || code === "EACCES";
+      if (!retryable || attempt >= attempts - 1) throw error;
+      // Synchronous bounded backoff (launcher context has no async loop here).
+      const until = Date.now() + 100 * (attempt + 1);
+      while (Date.now() < until) { /* spin briefly; total worst case ~1.5s */ }
+    }
+  }
 }
 
 function recoveryMarkerPath(scopeDir) {
@@ -111,8 +157,14 @@ export function transactionalNpmUpdate({
   const stagedPackage = join(stageRoot, "node_modules", ...pkgName.split("/"));
 
   // D1: stage to the side. --prefix keeps npm entirely inside stageRoot; the live tree
-  // and the npm bin shims are untouched until the swap.
-  mkdirSync(stageRoot, { recursive: true });
+  // and the npm bin shims are untouched until the swap. A failure HERE (mkdir EACCES,
+  // ENOSPC) must NOT fall back to the destructive legacy install (review High 4): the
+  // caller sees a normal phase failure with live untouched.
+  try {
+    mkdirSync(stageRoot, { recursive: true });
+  } catch (error) {
+    return { ok: false, phase: "stage", error: "could not create staging directory: " + (error?.message ?? String(error)) };
+  }
   const spec = pkgName + "@" + (targetVersion || tag);
   log("Staging " + spec + " into " + stageRoot);
   const install = runNpm(["install", "--prefix", stageRoot, "--no-audit", "--no-fund", spec]);
@@ -131,20 +183,25 @@ export function transactionalNpmUpdate({
   // D3: swap. live -> backup, stage -> live, re-verify live, rollback on failure.
   const backupRoot = join(scopeDir, stampedName(".ocx-backup"));
   const backupPackage = join(backupRoot, "opencodex");
-  mkdirSync(backupRoot, { recursive: true });
   try {
-    rename(packageDir, backupPackage);
+    mkdirSync(backupRoot, { recursive: true });
+  } catch (error) {
+    try { rmSync(stageRoot, { recursive: true, force: true }); } catch { /* best effort */ }
+    return { ok: false, phase: "swap-backup", error: "could not create backup directory: " + (error?.message ?? String(error)) };
+  }
+  try {
+    renameWithRetry(rename, packageDir, backupPackage);
   } catch (error) {
     try { rmSync(stageRoot, { recursive: true, force: true }); } catch { /* best effort */ }
     try { rmSync(backupRoot, { recursive: true, force: true }); } catch { /* best effort */ }
     return { ok: false, phase: "swap-backup", error: "could not move live tree aside: " + (error?.message ?? String(error)) };
   }
   try {
-    rename(stagedPackage, packageDir);
+    renameWithRetry(rename, stagedPackage, packageDir);
   } catch (error) {
     // Rollback: reverse the first rename. Double fault leaves the recovery marker.
     try {
-      rename(backupPackage, packageDir);
+      renameWithRetry(rename, backupPackage, packageDir);
       try { rmSync(stageRoot, { recursive: true, force: true }); } catch { /* best effort */ }
       try { rmSync(backupRoot, { recursive: true, force: true }); } catch { /* best effort */ }
       return { ok: false, phase: "swap-live", rolledBack: true, error: "could not place staged tree: " + (error?.message ?? String(error)) };
@@ -186,4 +243,3 @@ export function transactionalNpmUpdate({
   try { rmSync(stageRoot, { recursive: true, force: true }); } catch { /* best effort */ }
   return { ok: true, phase: "done", backup: backupPackage };
 }
-

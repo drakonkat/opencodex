@@ -23,6 +23,8 @@ function writeTree(packageDir: string, version: string): void {
   }));
   writeFileSync(join(packageDir, "bin", "ocx.mjs"), "#!/usr/bin/env node\n" + "x".repeat(2048));
   writeFileSync(join(packageDir, "node_modules", "bun", "package.json"), JSON.stringify({ name: "bun" }));
+  // The manifest size-gates the real Bun binary (>= 10MB); give the fixture one.
+  writeFileSync(join(packageDir, "node_modules", "bun", "bun.exe"), Buffer.alloc(10 * 1024 * 1024 + 1024));
   writeFileSync(join(packageDir, "node_modules", "zod", "package.json"), JSON.stringify({ name: "zod" }));
 }
 
@@ -170,4 +172,3 @@ describe("#1942 transactional update", () => {
     expect(existsSync(backupRoot)).toBe(false);
   });
 });
-
