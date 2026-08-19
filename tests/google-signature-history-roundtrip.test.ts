@@ -54,6 +54,8 @@ function scopeFor(
       adapterName: "google",
       modelId,
       credentialIdentity: `cred-${providerName}`,
+      // v4 (#1926): the durable store fails closed without a durable credential identity.
+      credentialDurableIdentity: `credential:test-${providerName}`,
     },
   };
 }

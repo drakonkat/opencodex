@@ -18,9 +18,11 @@ import {
   reasoningReplayCodexCredentialIdentity,
   reasoningReplayDestinationIdentity,
   durableReplayDestinationIdentity,
+  durableReplayCredentialIdentity,
   reasoningReplayKeyCredentialIdentity,
   reasoningReplayOAuthCredentialIdentity,
 } from "../../responses/reasoning-replay-cache";
+import { awaitThoughtSignatureDurability, thoughtSignatureReplaySalt } from "../../responses/thought-signature-replay";
 import { buildCompactV1Output, COMPACT_PROMPT, decodeCompactionSummary, extractCompactUserMessages } from "../../responses/compaction";
 import { FORWARD_HEADERS, sanitizeReasoningInputContent } from "../../adapters/openai-responses";
 import {
@@ -326,10 +328,20 @@ function bindRouteReasoningReplayScope(args: {
 }): void {
   const { parsed, providerName, provider, adapterName } = args;
   let credentialIdentity: string | undefined;
+  let credentialDurableIdentity: string | undefined;
+  const durableSalt = thoughtSignatureReplaySalt();
   if (provider.authMode === "oauth") {
     credentialIdentity = reasoningReplayOAuthCredentialIdentity(
       args.oauthCredentialSnapshot,
       provider.headers,
+    );
+    // The persisted account-slot id survives token refresh and restarts; the rotating
+    // generation deliberately does NOT participate (#1926 design: rotation-safe).
+    credentialDurableIdentity = durableReplayCredentialIdentity(
+      "oauth",
+      args.oauthCredentialSnapshot?.accountId,
+      provider.headers,
+      durableSalt,
     );
   } else if (provider.authMode === "forward") {
     const poolContext = args.codexAuthContext?.kind === "pool"
@@ -349,8 +361,26 @@ function bindRouteReasoningReplayScope(args: {
       writerGeneration: poolContext?.writerGeneration,
       headers: provider.headers,
     });
+    // Durable identity requires a STABLE account handle. A bearer alone is rotating
+    // material; without an account id the durable store fails closed (audit blocker 2).
+    const codexDurableHandle = poolContext?.accountId
+      ?? poolContext?.chatgptAccountId
+      ?? args.forwardHeaders?.get("chatgpt-account-id")
+      ?? undefined;
+    credentialDurableIdentity = durableReplayCredentialIdentity(
+      "codex",
+      codexDurableHandle ?? undefined,
+      provider.headers,
+      durableSalt,
+    );
   } else if (provider.authMode !== "local") {
     credentialIdentity = reasoningReplayKeyCredentialIdentity(provider);
+    credentialDurableIdentity = durableReplayCredentialIdentity(
+      "key",
+      nonEmptyProviderApiKey(provider),
+      provider.headers,
+      durableSalt,
+    );
   }
   const providerDestinationIdentity = reasoningReplayDestinationIdentity(provider.baseUrl);
   bindReasoningReplayScope(
@@ -363,9 +393,16 @@ function bindRouteReasoningReplayScope(args: {
           adapterName,
           modelId: parsed.modelId,
           credentialIdentity,
+          ...(credentialDurableIdentity ? { credentialDurableIdentity } : {}),
         }
       : undefined,
   );
+}
+
+function nonEmptyProviderApiKey(provider: OcxProviderConfig): string | undefined {
+  return typeof provider.apiKey === "string" && provider.apiKey.trim().length > 0
+    ? provider.apiKey
+    : undefined;
 }
 
 function isFixedCodexAccount(authCtx: CodexAuthContext): boolean {
@@ -3616,6 +3653,10 @@ async function handleResponsesInner(
         responseStateOptions(adapterNeedsForcedContinuation(adapter.name)),
       );
     }
+    // #1926 gap 2: the buffered path queued its signature persists inside
+    // buildResponseJSON; bound the durability window before the JSON becomes
+    // externally visible.
+    await awaitThoughtSignatureDurability();
     return new Response(JSON.stringify(json), { headers: { "Content-Type": "application/json" } });
   }
 
@@ -4461,6 +4502,8 @@ async function handleResponsesInner(
         responseStateOptions(activeAdapter.name === "kiro"),
       );
     }
+    // #1926 gap 2: same buffered-path durability bound as the primary branch.
+    await awaitThoughtSignatureDurability();
     return new Response(JSON.stringify(json), { headers: { "Content-Type": "application/json" } });
   }
 
