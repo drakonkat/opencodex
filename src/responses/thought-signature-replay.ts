@@ -20,7 +20,7 @@
  * destination, adapter, model and credential — so a signature can only ever be replayed into
  * the turn that produced it.
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { atomicWriteFileAsync, getConfigDir } from "../config";
@@ -87,6 +87,9 @@ export function thoughtSignatureReplaySalt(): Buffer | undefined {
   try {
     const raw = readFileSync(saltPath());
     if (raw.length >= 16) {
+      // Re-assert owner-only permissions on every load: a pre-existing file may have
+      // been created before this guard or loosened by external tooling.
+      try { chmodSync(saltPath(), 0o600); } catch { /* best effort on exotic filesystems */ }
       cachedSalt = raw;
       return cachedSalt;
     }

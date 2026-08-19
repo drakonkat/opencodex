@@ -361,11 +361,13 @@ function bindRouteReasoningReplayScope(args: {
       writerGeneration: poolContext?.writerGeneration,
       headers: provider.headers,
     });
-    // Durable identity requires a STABLE account handle. A bearer alone is rotating
-    // material; without an account id the durable store fails closed (audit blocker 2).
+    // Durable identity requires a STABLE, TRUSTED account handle. Pool context comes from
+    // our own account store; a client-supplied chatgpt-account-id header is attacker
+    // -influenceable bucket selection and a bearer alone is rotating material — both are
+    // refused, so direct-forward turns get no durable scope (fail closed; the in-process
+    // cache still covers same-process replay).
     const codexDurableHandle = poolContext?.accountId
       ?? poolContext?.chatgptAccountId
-      ?? args.forwardHeaders?.get("chatgpt-account-id")
       ?? undefined;
     credentialDurableIdentity = durableReplayCredentialIdentity(
       "codex",
