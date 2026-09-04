@@ -4,6 +4,9 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { applyRequestTransforms, clearTransformCacheForTests, resolveTransformPath } from "../src/transforms";
 import { validateConfigCandidate } from "../src/config";
+import { providerManagementConfigError } from "../src/server/auth-cors";
+import { providerConfigSeed } from "../src/providers/derive";
+import { getProviderRegistryEntry } from "../src/providers/registry";
 import type { OcxConfig, OcxParsedRequest, OcxProviderConfig } from "../src/types";
 
 describe("requestTransforms", () => {
@@ -18,7 +21,9 @@ describe("requestTransforms", () => {
   afterEach(() => {
     try {
       rmSync(testDir, { recursive: true, force: true });
-    } catch {}
+    } catch (_err) {
+      void _err;
+    }
   });
 
   test("resolveTransformPath resolves relative to configDir and absolute paths", () => {
@@ -136,6 +141,40 @@ describe("requestTransforms", () => {
     expect(result._requestTransformsApplied).toBe(true);
   });
 
+  test("rejects malformed replacement objects like {} and retains current request", async () => {
+    const invalidTransformPath = join(testDir, "invalid.ts");
+    writeFileSync(invalidTransformPath, "export default () => { return {}; };");
+
+    const config: OcxConfig = {
+      port: 10100,
+      defaultProvider: "openai",
+      providers: {
+        openai: { adapter: "openai-responses", baseUrl: "https://example.com" },
+      },
+      requestTransforms: [invalidTransformPath],
+    };
+
+    const initialParsed: OcxParsedRequest = {
+      modelId: "gpt-5.5",
+      context: { messages: [{ role: "user", content: "original-message", timestamp: 123 }] },
+      stream: false,
+      options: {},
+    };
+
+    const result = await applyRequestTransforms({
+      parsed: initialParsed,
+      providerName: "openai",
+      modelId: "gpt-5.5",
+      providerConfig: config.providers.openai,
+      config,
+    });
+
+    expect(result._requestTransformsApplied).toBe(true);
+    expect(result.modelId).toBe("gpt-5.5");
+    expect(result.context.messages.length).toBe(1);
+    expect((result.context.messages[0] as any).content).toBe("original-message");
+  });
+
   test("configSchema and providerConfigSchema validate requestTransforms correctly", () => {
     const valid = validateConfigCandidate({
       port: 10100,
@@ -154,5 +193,18 @@ describe("requestTransforms", () => {
       expect(valid.config.requestTransforms).toEqual(["./transforms/pxpipe.ts"]);
       expect(valid.config.providers.openai.requestTransforms).toEqual(["./transforms/provider-transform.ts"]);
     }
+  });
+
+  test("providerManagementConfigError validates canonical openai with requestTransforms", () => {
+    const entry = getProviderRegistryEntry("openai");
+    if (!entry) return;
+    const seed = providerConfigSeed(entry);
+
+    const validCandidate = { ...seed, codexAccountMode: "pool" as const, requestTransforms: ["./custom.ts"] };
+    expect(providerManagementConfigError("openai", validCandidate)).toBeNull();
+
+    const invalidCandidate = { ...seed, codexAccountMode: "pool" as const, requestTransforms: [""] };
+    expect(providerManagementConfigError("openai", invalidCandidate))
+      .toBe("provider openai requestTransforms.0 must be a nonblank string");
   });
 });
