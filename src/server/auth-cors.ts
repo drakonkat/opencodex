@@ -696,6 +696,8 @@ export function providerManagementConfigError(name: unknown, provider: unknown):
   if (structuredOutputOptOutError) return `provider ${name} ${structuredOutputOptOutError}`;
   const retainModelsError = nonBlankStringArrayConfigError(raw.retainModels, "retainModels");
   if (retainModelsError) return `provider ${name} ${retainModelsError}`;
+  const requestTransformsError = nonBlankStringArrayConfigError(raw.requestTransforms, "requestTransforms");
+  if (requestTransformsError) return `provider ${name} ${requestTransformsError}`;
   const toolReasoningOptOutError = nonBlankStringArrayConfigError(
     raw.omitReasoningEffortWithToolsModels,
     "omitReasoningEffortWithToolsModels",
@@ -840,6 +842,7 @@ const PROVIDER_CONFIG_FIELD_POLICY = {
   noTopPModels: "editor",
   noPenaltyModels: "editor",
   noStructuredOutputModels: "editor",
+  requestTransforms: "editor",
   omitReasoningEffortWithToolsModels: "editor",
   parallelToolCalls: "editor",
   pinParallelToolCallsFalse: "editor",
