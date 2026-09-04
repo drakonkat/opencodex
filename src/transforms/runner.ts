@@ -8,6 +8,25 @@ import type { RequestTransformContext, RequestTransformFn, RequestTransformModul
 
 const transformCache = new Map<string, Promise<RequestTransformFn | null>>();
 
+/**
+ * Validate that an object returned by a dynamic transform matches the minimal required
+ * structure of an OcxParsedRequest before replacing the active request.
+ */
+function isValidParsedRequest(val: unknown): val is OcxParsedRequest {
+  if (!val || typeof val !== "object" || Array.isArray(val)) return false;
+  const candidate = val as Record<string, unknown>;
+  return (
+    typeof candidate.modelId === "string" &&
+    candidate.context !== null &&
+    typeof candidate.context === "object" &&
+    Array.isArray((candidate.context as Record<string, unknown>).messages)
+  );
+}
+
+/**
+ * Resolve a transform specifier into an absolute file path or module identifier.
+ * Checks against the config directory (~/.opencodex) first, then current working directory.
+ */
 export function resolveTransformPath(specifier: string, configDir: string = getConfigDir()): string {
   const expanded = expandUserPath(specifier.trim());
   if (isAbsolute(expanded)) {
@@ -24,6 +43,10 @@ export function resolveTransformPath(specifier: string, configDir: string = getC
   return expanded;
 }
 
+/**
+ * Dynamically import and cache a request transform handler function.
+ * Supports modules exporting either a default function or a named "transform" function.
+ */
 export async function loadTransform(
   specifier: string,
   configDir: string = getConfigDir(),
@@ -55,6 +78,10 @@ export async function loadTransform(
   return flight;
 }
 
+/**
+ * Execute all configured global and provider-scoped request transforms sequentially on the request.
+ * Operates once per turn and guards against duplicate execution across retries or replays.
+ */
 export async function applyRequestTransforms(args: {
   parsed: OcxParsedRequest;
   providerName: string;
@@ -105,7 +132,13 @@ export async function applyRequestTransforms(args: {
     try {
       const result = await fn(currentParsed, context);
       if (result && typeof result === "object") {
-        currentParsed = result;
+        if (isValidParsedRequest(result)) {
+          currentParsed = result;
+        } else {
+          console.warn(
+            `[opencodex] request transform "${specifier}" returned an invalid request object; retaining current request.`,
+          );
+        }
       }
     } catch (err) {
       console.warn(`[opencodex] error running request transform "${specifier}":`, err);
@@ -116,6 +149,9 @@ export async function applyRequestTransforms(args: {
   return currentParsed;
 }
 
+/**
+ * Clear the internal transform import cache. Intended for test suite isolation.
+ */
 export function clearTransformCacheForTests(): void {
   transformCache.clear();
 }

@@ -3259,6 +3259,7 @@ async function handleResponsesInner(
     providerConfig: route.provider,
     config,
   });
+  toolBridgeMaps = buildToolBridgeMaps(parsed, translatorBudget);
   // Attribute local auth/cooldown failures to the public selector too; exact auth may fail before
   // the normal post-resolution provider label is assigned.
   if (route.codexAccountNamespace) {
