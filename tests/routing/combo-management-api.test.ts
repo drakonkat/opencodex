@@ -837,6 +837,7 @@ describe("combo management API", () => {
         free: { ...VALID_COMBO, alias: "deepseek-v4-flash" },
       },
     });
+    for (const provider of Object.values(config.providers)) provider.liveModels = false;
     config.providers.a!.modelContextWindows = { m1: 128_000 };
 
     const response = await comboApi(config, "GET", "/api/subagent-models");
