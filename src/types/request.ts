@@ -52,7 +52,7 @@ export interface OcxParsedRequest {
   _rawBody?: unknown;
   /**
    * True when requestTransforms have already been evaluated for this request turn.
-   * Prevents duplicate execution across internal retries, continuations, or replays.
+   * Prevents duplicate execution when internal retries reuse this parsed request.
    */
   _requestTransformsApplied?: boolean;
   /**

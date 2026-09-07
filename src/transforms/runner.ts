@@ -5,6 +5,7 @@ import type { OcxConfig, OcxParsedRequest, OcxProviderConfig } from "../types";
 import { expandUserPath, getConfigDir } from "../config/paths";
 import { isVisionEligibleModel } from "../vision/eligibility";
 import type { RequestTransformContext, RequestTransformFn, RequestTransformModule } from "./types";
+import { syncTransformedResponsesBody } from "./responses-body";
 
 const transformCache = new Map<string, Promise<RequestTransformFn | null>>();
 
@@ -80,7 +81,7 @@ export async function loadTransform(
 
 /**
  * Execute all configured global and provider-scoped request transforms sequentially on the request.
- * Operates once per turn and guards against duplicate execution across retries or replays.
+ * Runs once per parsed request; internal retries that reuse it do not re-run the handlers.
  */
 export async function applyRequestTransforms(args: {
   parsed: OcxParsedRequest;
@@ -124,6 +125,7 @@ export async function applyRequestTransforms(args: {
   };
 
   const configDir = getConfigDir();
+  const before = { ...parsed, context: structuredClone(parsed.context), options: structuredClone(parsed.options) };
   let currentParsed = parsed;
 
   for (const specifier of specifiers) {
@@ -133,7 +135,8 @@ export async function applyRequestTransforms(args: {
       const result = await fn(currentParsed, context);
       if (result && typeof result === "object") {
         if (isValidParsedRequest(result)) {
-          currentParsed = result;
+          // A complete canonical replacement must not discard proxy-owned replay/auth state.
+          currentParsed = { ...currentParsed, ...result, previousResponseId: result.previousResponseId };
         } else {
           console.warn(
             `[opencodex] request transform "${specifier}" returned an invalid request object; retaining current request.`,
@@ -145,6 +148,7 @@ export async function applyRequestTransforms(args: {
     }
   }
 
+  syncTransformedResponsesBody(before, currentParsed);
   currentParsed._requestTransformsApplied = true;
   return currentParsed;
 }
