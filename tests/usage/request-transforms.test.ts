@@ -131,6 +131,20 @@ describe("requestTransforms", () => {
     expect((parsed._rawBody as typeof body).input).toBe(body.input);
   });
 
+  test("editing one repeated message keeps each native message's own metadata", () => {
+    const body = { model: "model", input: [
+      { role: "user", content: "continue", vendor_id: "first" },
+      { role: "user", content: "continue", vendor_id: "second" },
+    ] };
+    const parsed = parseRequest(body);
+    const before = structuredClone(parsed);
+    parsed.context.messages[0]!.content = "changed";
+    syncTransformedResponsesBody(before, parsed);
+    expect((parsed._rawBody as typeof body).input).toEqual([
+      { role: "user", content: "changed", vendor_id: "first" }, body.input[1],
+    ]);
+  });
+
   test.each(["openai-responses", "openai-chat"])("%s dispatch uses transformed messages and namespaced tool metadata", async adapter => {
     const path = join(testDir, "integration.ts");
     writeFileSync(path, `export default function(parsed) {

@@ -88,7 +88,11 @@ function transformedInput(raw: Row, before: OcxParsedRequest, after: OcxParsedRe
     pending = [];
   }
   const result: unknown[] = [];
-  const transformedKeys = new Set(transformed.map(row => JSON.stringify([row])));
+  const remainingMatches = new Map<string, number>();
+  for (const row of transformed) {
+    const key = JSON.stringify([row]);
+    remainingMatches.set(key, (remainingMatches.get(key) ?? 0) + 1);
+  }
   const lengths = [...new Set([...pools.keys()].map(key => (JSON.parse(key) as unknown[]).length))].sort((a, b) => b - a);
   for (let index = 0; index < transformed.length;) {
     let matched = false;
@@ -96,6 +100,10 @@ function transformedInput(raw: Row, before: OcxParsedRequest, after: OcxParsedRe
       const retained = pools.get(JSON.stringify(transformed.slice(index, index + length)))?.shift();
       if (!retained) continue;
       result.push(...retained.prefix, ...retained.rows);
+      for (const row of transformed.slice(index, index + length)) {
+        const key = JSON.stringify([row]);
+        remainingMatches.set(key, (remainingMatches.get(key) ?? 0) - 1);
+      }
       index += length;
       matched = true;
       break;
@@ -105,10 +113,12 @@ function transformedInput(raw: Row, before: OcxParsedRequest, after: OcxParsedRe
       const next = transformed[index]!;
       const oldKey = JSON.stringify([old]);
       const reusable = old && old.role === next.role && old.type === next.type
-        && !transformedKeys.has(oldKey)
+        && (pools.get(oldKey)?.length ?? 0) > (remainingMatches.get(oldKey) ?? 0)
         ? pools.get(oldKey)?.shift() : undefined;
       if (reusable) result.push(...reusable.prefix, ...(reusable.rows.length === 1 ? [overlay(reusable.rows[0], old, next)] : [next]));
       else result.push(next);
+      const nextKey = JSON.stringify([next]);
+      remainingMatches.set(nextKey, (remainingMatches.get(nextKey) ?? 0) - 1);
       index++;
     }
   }
