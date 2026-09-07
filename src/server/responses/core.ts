@@ -3143,7 +3143,6 @@ async function handleResponsesInner(
   }
 
   let parsed: OcxParsedRequest;
-  let toolBridgeMaps: ReturnType<typeof buildToolBridgeMaps>;
   try {
     parsed = parseRequest(body);
     parsed._promptCacheKeyIsSharedCohort = options.promptCacheKeyIsSharedCohort;
@@ -3172,7 +3171,6 @@ async function handleResponsesInner(
     if (options.comboReplaySnapshot?.recoveredPlaintext) {
       markBodyNonPersistable(parsed._rawBody);
     }
-    toolBridgeMaps = buildToolBridgeMaps(parsed, translatorBudget);
     if (previousResponseInputExpanded) parsed._previousResponseInputExpanded = true;
     const providerContinuationCandidate = options.comboReplaySnapshot
       ? options.comboReplaySnapshot.providerContinuation
@@ -3615,7 +3613,7 @@ async function handleResponsesInner(
     providerConfig: route.provider,
     config,
   });
-  toolBridgeMaps = buildToolBridgeMaps(parsed, translatorBudget);
+  const toolBridgeMaps = buildToolBridgeMaps(parsed, translatorBudget);
   // Attribute local auth/cooldown failures to the public selector too; exact auth may fail before
   // the normal post-resolution provider label is assigned.
   if (route.codexAccountNamespace) {
