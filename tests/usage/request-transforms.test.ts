@@ -2,12 +2,12 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { applyRequestTransforms, clearTransformCacheForTests, resolveTransformPath } from "../src/transforms";
-import { validateConfigCandidate } from "../src/config";
-import { providerManagementConfigError } from "../src/server/auth-cors";
-import { providerConfigSeed } from "../src/providers/derive";
-import { getProviderRegistryEntry } from "../src/providers/registry";
-import type { OcxConfig, OcxParsedRequest, OcxProviderConfig } from "../src/types";
+import { applyRequestTransforms, clearTransformCacheForTests, resolveTransformPath } from "../../src/transforms";
+import { validateConfigCandidate } from "../../src/config";
+import { providerManagementConfigError } from "../../src/server/auth-cors";
+import { providerConfigSeed } from "../../src/providers/derive";
+import { getProviderRegistryEntry } from "../../src/providers/registry";
+import type { OcxConfig, OcxParsedRequest, OcxProviderConfig } from "../../src/types";
 
 describe("requestTransforms", () => {
   let testDir: string;
