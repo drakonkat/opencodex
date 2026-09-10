@@ -6,6 +6,7 @@ import {
   codexAutoStartEnabled,
   modelPreferHostedToolsConfigError,
   providerModelCostsConfigError,
+  providerWebSearchBridgeConfigError,
   requestPacingConfigError,
   retryOn429PolicyConfigError,
   sanitizeModelCostsForDisplay,
@@ -13,6 +14,7 @@ import {
 import {
   apiKeyTransportConfigError,
   booleanRecordConfigError,
+  providerReasoningPinsConfigError,
   modelAdapterRecordConfigError,
   nonBlankStringArrayConfigError,
   positiveIntegerConfigError,
@@ -592,6 +594,8 @@ export function providerManagementConfigError(name: unknown, provider: unknown):
     return "provider must be a plain object";
   }
   const raw = provider as Record<string, unknown>;
+  const pinsError = providerReasoningPinsConfigError(raw);
+  if (pinsError) return pinsError;
   for (const field of FORBIDDEN_PROVIDER_RUNTIME_FIELDS) {
     if (Object.hasOwn(raw, field)) return `provider ${name} must not include runtime field "${field}"`;
   }
@@ -605,6 +609,9 @@ export function providerManagementConfigError(name: unknown, provider: unknown):
     }
     if (seed) seed.codexAccountMode = raw.codexAccountMode;
     const canonicalCandidate = { ...raw };
+    // Validated operator overlays do not change the canonical auth/transport seed.
+    delete canonicalCandidate.pinnedReasoningEffort;
+    delete canonicalCandidate.modelPinnedReasoningEfforts;
     delete canonicalCandidate.responsesSnapshotRepair;
     // modelCosts is a user-owned display overlay, not part of the canonical
     // forward seed; it is validated separately below (providerModelCostsConfigError).
@@ -655,6 +662,10 @@ export function providerManagementConfigError(name: unknown, provider: unknown):
   const requestPacingError = requestPacingConfigError(raw.requestPacing);
   if (requestPacingError) {
     return `provider ${JSON.stringify(redactSecretString(name))} ${requestPacingError}`;
+  }
+  const webSearchBridgeError = providerWebSearchBridgeConfigError(raw.webSearchBridge);
+  if (webSearchBridgeError) {
+    return `provider ${JSON.stringify(redactSecretString(name))} ${webSearchBridgeError}`;
   }
   const upstreamHttpVersionError = upstreamHttpVersionConfigError(raw.upstreamHttpVersion);
   if (upstreamHttpVersionError) {
@@ -843,6 +854,8 @@ const PROVIDER_CONFIG_FIELD_POLICY = {
   reasoningEfforts: "editor",
   modelReasoningEfforts: "editor",
   modelDefaultReasoningEfforts: "editor",
+  pinnedReasoningEffort: "editor",
+  modelPinnedReasoningEfforts: "editor",
   modelSupportsReasoningSummaries: "editor",
   modelSupportsVerbosity: "editor",
   supportsVerbosity: "editor",
@@ -853,6 +866,7 @@ const PROVIDER_CONFIG_FIELD_POLICY = {
   xaiResponsesDefaultVersion: "runtime",
   supportsResponsesCustomTools: "editor",
   responsesSnapshotRepair: "editor",
+  webSearchBridge: "editor",
   reasoningEffortMap: "editor",
   modelReasoningEffortMap: "editor",
   reasoningWireFormat: "editor",

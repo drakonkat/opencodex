@@ -18,6 +18,7 @@ import {
   comboIdFromRawBody,
   concreteComboRequestBody,
   getCombo,
+  resolveComboId,
   isComboTargetInCooldown,
   NoAvailableComboTargetsError,
   noteComboSuccess,
@@ -103,7 +104,12 @@ import { fastPolicyForModel } from "../../providers/service-tier";
 import { parseFastOnlyRowId } from "../fast-row";
 import { applyOpenAiVirtualModel, resolveOpenAiCompactModel } from "../../providers/openai-virtual-models";
 import { isUsageDebugEnabled } from "../../usage/debug";
-import { readJsonRequestBody, DecompressedBodyTooLargeError, UnsupportedContentEncodingError } from "../request-decompress";
+import {
+  readJsonRequestBody,
+  resolveInboundBodyLimitBytes,
+  DecompressedBodyTooLargeError,
+  UnsupportedContentEncodingError,
+} from "../request-decompress";
 import { resolveAdapter, resolveWireProtocolOverride } from "../adapter-resolve";
 import { hasKeyPoolFailover, rotateProviderTransportOn429 } from "../../providers/key-failover";
 import { shouldAttemptImageTierRetry } from "../image-retry";
@@ -152,6 +158,7 @@ import {
 import { fetchWithHeaderTimeout, providerFetch, safeHostLabel, safeOriginLabel } from "./fetch-helpers";
 import { mapCodexAuthContextErrorToResponse, nativeMainRefreshFailureResponse } from "./codex-auth-error";
 import { sessionLaneIdFromRequest } from "../request-log-conversation";
+import { recallComboForLane } from "./combo-session-recall";
 
 export const COMPACT_RESPONSE_MAX_BYTES = 32 * 1024 * 1024;
 
@@ -520,7 +527,7 @@ export async function handleResponsesCompact(
 ): Promise<Response> {
   let body: unknown;
   try {
-    body = await readJsonRequestBody(req);
+    body = await readJsonRequestBody(req, undefined, resolveInboundBodyLimitBytes(config.maxInboundBodyBytes));
   } catch (err) {
     return decodeRequestErrorResponse(err, "responses-compact");
   }
@@ -536,12 +543,28 @@ export async function handleResponsesCompact(
   // a local rather than written back to `raw.model`: assigning to the property widens it out
   // of the `string` narrowing the guard above just established.
   const compactFastRow = parseFastOnlyRowId(config, () => raw.model as string);
-  const compactModel = compactFastRow ? compactFastRow.baseId : raw.model;
+  let compactModel = compactFastRow ? compactFastRow.baseId : raw.model;
   if (compactFastRow) (raw as Record<string, unknown>).model = compactModel;
   // The client's own selector, kept for the request log: `raw.model` is rewritten to the
   // base id above, and logCtx.requestedModel is assigned from it further down, so without
   // this the log would lose which id the client actually asked for.
   const compactRequestedModel = compactFastRow ? compactFastRow.baseId + "--fast" : raw.model;
+
+  // Recall the last completed client-visible bare model after a combo switch (#3891).
+  // Configured selectors take precedence over this implicit session hint.
+  if (typeof compactModel === "string" && !compactModel.includes("/") && !compactFastRow
+    && !resolveComboId(config, compactModel)) {
+    const recalledComboId = recallComboForLane(config, sessionLaneIdFromRequest(req.headers), compactModel);
+    if (recalledComboId) {
+      (raw as Record<string, unknown>).model = `combo/${recalledComboId}`;
+      // Keep the routed identity in sync: the bare model can 404 outright (no
+      // canonical openai provider) or resolve straight onto a native-compact
+      // provider, both bypassing combo failover. The combo selector resolves
+      // through tryPickComboModel, whose route.combo skips the native compact
+      // endpoint.
+      compactModel = `combo/${recalledComboId}`;
+    }
+  }
 
   let route;
   try {
@@ -997,6 +1020,7 @@ export async function handleResponsesCompact(
             upstream.headers,
             authCtx.writerGeneration,
             authCtx.kind === "main-pool" ? authCtx.mainQuotaWriter : undefined,
+            { modelId: route.modelId },
           );
         }
         recordCompactPoolOutcome(authCtx, upstream.status, {
@@ -1094,7 +1118,8 @@ export async function handleResponsesCompact(
         }
       }
     }
-    return buffered;
+    // A native compact 404 falls back to a regular Responses compaction turn.
+    if (buffered.status !== 404) return buffered;
     } finally {
       releaseUpstreamHostAdmission(compactHostAdmissionLease);
       releaseCodexAuthContextProbeLease(authCtx);
@@ -1111,7 +1136,7 @@ export async function handleResponsesCompact(
     // the completed event back into the v1 compact JSON contract below. Combo-dispatched
     // turns also go out as SSE: failover can land on a canonical child that rejects a
     // non-streaming turn, and every combo-capable provider already serves streaming traffic.
-    stream: accountGatedCompactWireModel || route.combo ? true : false,
+    stream: isCanonicalOpenAiForwardProvider(route.provider) || accountGatedCompactWireModel || route.combo ? true : false,
     input: [...inputItems, { type: "compaction_trigger" }],
   };
   const internalHeaders = new Headers({ "content-type": "application/json" });

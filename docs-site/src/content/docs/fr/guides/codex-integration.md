@@ -233,6 +233,14 @@ opencodex encode cette déclaration et son historique sous forme d'outil de fonc
 cycle de vie diffusé de l'appel de fonction en `custom_tool_call` avant que Codex ne le reçoive. Le routage natif
 par transfert OpenAI et l'outil personnalisé `apply_patch`, qui est pris en charge, restent inchangés.
 
+Avant le premier appel, les tours routés en mode code reçoivent aussi les règles de l'hôte pour les
+outils auxiliaires imbriqués : `tools.apply_patch` prend une seule chaîne qui commence et se termine
+par les lignes de marqueur de patch seules, sans habillage ; l'isolate ne dispose pas de `import`,
+et les commandes longues sont interrogées via `write_stdin`. Lorsqu'un résultat exec en mode code
+sur le chemin natif Responses routé, Kiro ou Cursor contient encore l'un des messages d'échec de
+l'hôte, opencodex ajoute une indication d'une ligne qui nomme la règle. Cette modification ne
+réécrit ni le code du modèle ni le texte de son patch.
+
 Le fournisseur sélectionné doit prendre en charge les appels de fonctions ou d'outils. Un fournisseur purement
 textuel dépourvu de cette prise en charge ne peut pas utiliser `exec`, Browser ni Computer Use. Les lignes
 OpenAI natives conservent leur mode d'outil en amont.
@@ -367,20 +375,19 @@ délégation v1/base/v2 et de ses mécanismes de repli.
 
 ## Préchauffage des comptes Codex
 
-Lorsqu'un compte ChatGPT est ajouté au groupe de comptes Codex, opencodex le vérifie avant de l'enregistrer
-avec une petite requête en streaming vers le service Codex Responses. La requête utilise un véritable tableau
-d'éléments Responses (`input: [{ type: "message", ... }]`), attend `response.completed` et utilise par défaut
-`gpt-5.4-mini`. Si ce modèle renvoie HTTP 400, opencodex réessaie avec `gpt-5.5` ; les détails structurés de
-l'erreur en amont sont affichés sans exposer le corps brut de la réponse. La revalidation en arrière-plan est
-distincte et désactivée par défaut. Elle ne s'exécute que si Token Guardian est actif, si la stratégie
-d'actualisation `chatgpt` vaut `proactive` et si `tokenGuardian.codexWarmupEnabled` vaut true.
+L’ajout ou la réauthentification vérifie normalement le compte avant son enregistrement par une petite requête attendant `response.completed`. Le modèle par défaut est `gpt-5.4-mini`, avec un essai sur `gpt-5.5` en cas de HTTP 400. Les erreurs publiques contiennent des catégories fixes, sans corps de réponse brut.
+
+Si la lecture authentifiée des quotas avec le nouveau jeton OAuth confirme un quota de 5 heures, hebdomadaire ou mensuel épuisé, le compte est enregistré sans appel au modèle et affiche **Validation en attente**. Il reste exclu du routage après un redémarrage ou un renouvellement du jeton. Après récupération du quota, actualisez les quotas : une lecture récente et complète avec de la capacité disponible permet une petite requête de validation. Seule sa réussite active le compte. Tout échec conserve la restriction. Les lectures passives ne déclenchent pas cette requête. Un quota inconnu à l’inscription conserve la vérification habituelle.
+
+`ocx account refresh openai` et `ocx account list openai --quota --refresh` consultent uniquement les quotas. La validation du modèle consomme du quota et nécessite une session humaine du tableau de bord : après récupération, ouvrez `ocx gui` et cliquez sur **Refresh quotas**. Sur un hôte sans interface graphique, accédez à son tableau de bord depuis votre navigateur ; le jeton administrateur seul n’autorise pas la validation. Un compte en pause peut être validé sans être repris ni sélectionné. Les erreurs d’autorisation restent visibles jusqu’à une validation ou une réauthentification réussie.
+
+La revalidation en arrière-plan est distincte et désactivée par défaut. Elle nécessite Token Guardian, la politique `proactive` du fournisseur `openai` et `tokenGuardian.codexWarmupEnabled`, et ignore les comptes dont la validation d’inscription est en attente.
 
 ## Restauration de Codex natif
 
-opencodex ne vous enferme jamais dans sa configuration. **`ocx stop` est l'unique commande qui restaure
-entièrement Codex natif** : elle arrête le proxy et le service d'arrière-plan s'il est installé, puis supprime
-toutes les lignes injectées et toutes les entrées routées du catalogue. La commande `codex` fonctionne alors
-exactement comme si opencodex n'avait jamais été installé :
+`ocx stop` arrête le proxy et le service d'arrière-plan installé, puis tente de restaurer Codex natif. OpenCodex retire les éléments de routage dont il peut vérifier la propriété et signale une restauration incomplète si les fichiers de configuration ne peuvent pas être récupérés en toute sécurité.
+
+Si la configuration ou le profil actuel diffère de l'original sauvegardé et que le journal ne contient pas le hash de l'état injecté de ce fichier, la récupération automatique conserve les deux fichiers et le journal sans les modifier. Un fichier déjà identique à son original n'est pas réécrit. La réinjection d'une configuration routée refuse aussi cet état incertain ; une configuration native peut créer un nouvel instantané. Voir les [règles de récupération](/guides/codex-integration/#recovery-without-injection-hashes).
 
 ```bash
 ocx stop       # stop the proxy + service, restore native Codex

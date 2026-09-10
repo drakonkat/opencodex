@@ -66,6 +66,10 @@ selector，而不是分配一个新名称。
 
 `openaiProviderTierVersion: 2` 标记当前的单提供者投影。对已发布的 v1 配置进行迁移之前，opencodex 会创建 `config.json.pre-openai-tiers-v2.bak`，且不会覆盖不同的备份文件，并会把已知的旧式命名空间选择 id 重写为裸 id。
 
+## 提供者命名空间别名
+
+提供者可以有内置缩写，例如 `google-antigravity` 的 `agy`。如果已配置的提供者名称或显式别名占用了该缩写（不区分大小写），另一个提供者的内置缩写就会在目录名称和别名路由中同时禁用。例如，配置名为 `agy` 的提供者后，Google 模型会显示为 `google-antigravity/<model>`，而 `agy/<model>` 会选择已配置的提供者。规范提供者名称仍要求大小写完全一致；无法识别的前缀继续沿用现有的模型路由回退行为。
+
 ## 提供者条目（`OcxProviderConfig`）
 
 | 字段 | 类型 | 含义 |
@@ -93,7 +97,7 @@ selector，而不是分配一个新名称。
 | `modelAutoCompactTokenLimits?` | `Record<string, number>` | 按模型设置的正安全整数软自动压缩预算。该值只能降低“上下文或最大输入的 90%”这一有效上限；没有已知的权威上下文窗口时不会输出。对于规范 `openai`，键必须是受支持的精确原生模型 ID，且不得包含提供者或账户选择器前缀。提供者 PATCH 会合并条目；将某个键设为 `null` 会删除该键，将整个字段设为 `null` 会清空映射。这些 `null` 删除标记仅适用于 PATCH。 |
 | `defaultMaxOutputTokens?` | `number` | 当客户端省略 `max_output_tokens` 时，`openai-chat` 的提供者级回退值。 |
 | `modelMaxOutputTokens?` | `Record<string, number>` | 正数型、按模型设置的 `openai-chat` 回退预算；精确/模式匹配优先于提供者默认值。 |
-| `modelCosts?` | `Record<string, Cost4>` | 按模型设置的显示价格（每 100 万 token 的美元数），以该提供者的精确上游模型 ID 为键（不是提供者标识符或路由后的 `provider/model` 标签），值为四个字段：`input`、`output`、`cacheRead`、`cacheWrite`（示例：`{ "deepseek-v4-flash": { "input": 0.14, "output": 0.28, "cacheRead": 0.0028, "cacheWrite": 0 } }`）。任何模型 ID 都是有效键——自定义提供者可以通过 `openai-chat` 适配器指向任意 OpenAI 兼容端点，即使不存在于内置目录中，本地 OpenAI 兼容和内部提供者的 ID 同样有效。用户配置的价格在 Logs 的 `~$` 和 Usage 估算中优先于内置目录；历史条目也会按当前覆盖项重新计价，因此修改价格可能改变过去的总额（回退顺序：用户配置 → jawcode 目录 → expected-price 覆盖 → 模型级厂商价格）；全零条目会回退到该顺序中的下一个来源。每个费率必须是大于等于 0 的有限数字，且不超过 1,000,000（每 100 万 token 的美元数）；超出范围的条目会在管理边界被拒绝，并在加载时被丢弃。仅用于显示的估算：覆盖项不影响路由、账户选择、配额或计费。 |
+| `modelCosts?` | `Record<string, Cost4>` | 按模型设置的显示价格（每 100 万 token 的美元数），以该提供者的精确上游模型 ID 为键（不是提供者标识符或路由后的 `provider/model` 标签），值为四个字段：`input`、`output`、`cacheRead`、`cacheWrite`（示例：`{ "deepseek-v4-flash": { "input": 0.14, "output": 0.28, "cacheRead": 0.0028, "cacheWrite": 0 } }`）。任何模型 ID 都是有效键——自定义提供者可以通过 `openai-chat` 适配器指向任意 OpenAI 兼容端点，即使不存在于内置目录中，本地 OpenAI 兼容和内部提供者的 ID 同样有效。用户配置的价格在 Logs 的 `~$` 和 Usage 估算中优先于内置目录；历史条目也会按当前覆盖项重新计价，因此修改价格可能改变过去的总额（回退顺序：用户配置 → jawcode 目录 → expected-price 覆盖 → 模型级厂商价格）；用户明确将所有费率设为零时，会得到已知的零费用估算；删除该模型的覆盖项即可恢复自动定价。目录中的全零价格仍会回退到下一个来源。每个费率必须是大于等于 0 的有限数字，且不超过 1,000,000（每 100 万 token 的美元数）；超出范围的条目会在管理边界被拒绝，并在加载时被丢弃。仅用于显示的估算：覆盖项不影响路由、账户选择、配额或计费。 |
 | `headers?` | `Record<string, string>` | 额外的上游请求头。会拒绝 Authorization、cookie、API key 头、嵌入换行符以及无效名称。 |
 | `openRouterRouting?` | `OpenRouterProviderRouting` | 默认的 OpenRouter `order`、`only` 和 `allowFallbacks` 偏好；仅对使用 `openai-chat` 的规范 OpenRouter 有效。 |
 | `modelOpenRouterRouting?` | `Record<string, OpenRouterProviderRouting>` | 精确模型 id 级别的覆盖项，会替换提供者级 OpenRouter 偏好。 |
@@ -394,6 +398,18 @@ Vercel AI Gateway 可以在多个底层推理提供者之间路由一个模型�
   }
 }
 ```
+
+## 模型显示名称编辑器
+
+仪表板的 **Models** 可让你为已发现的模型持久保存易读名称。展开提供者，找到一个已发现的模型，然后选择 **Name**。
+保存易读名称时，对话框会一直显示精确的 `provider/model` 选择器。选择 **Reset name** 可恢复为
+提供者元数据中的名称，或默认的选择器显示。**Name** 只改变显示；单独的别名铅笔图标用于修改
+短路由别名，并不是显示名称编辑器。原生 OpenAI 和自定义模型条目保留现有控件。
+
+如果更改已保存但刷新失败，对话框会反映已保存的覆盖值，并继续提供 **Retry**。如果服务器报告
+目录收敛失败，Retry 会重新执行目录收敛；如果只是列表请求失败，则重新加载列表。重置后的恢复
+会保留重置操作，不会恢复旧名称。请求的总时限为 60 秒，涵盖写入及后续的列表刷新。超时不会撤销
+写入：进行其他更改前，请使用 **Retry** 检查当前名称。
 
 ## 完整示例
 

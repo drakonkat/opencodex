@@ -66,6 +66,10 @@ managed map을 활성화하면 privacy-safe selector를 만들고, 이후 계정
 
 `openaiProviderTierVersion: 2`는 현재의 단일 공급자 투영을 표시합니다. 출시된 v1 설정을 마이그레이션하기 전에 opencodex는 `config.json.pre-openai-tiers-v2.bak`를 만들고, 기존에 다른 백업이 있더라도 덮어쓰지 않으며, 알려진 레거시 네임스페이스 지정 선택 id를 bare id로 다시 씁니다.
 
+## 공급자 네임스페이스 별칭
+
+공급자는 `google-antigravity`의 `agy`처럼 기본 축약 이름을 제공할 수 있습니다. 설정된 공급자 이름이나 명시적 별칭이 대소문자 구분 없이 그 이름을 사용하면, 다른 공급자의 기본 축약 이름은 카탈로그 표시와 별칭 라우팅 모두에서 비활성화됩니다. 예를 들어 `agy`라는 공급자를 설정하면 Google 모델은 `google-antigravity/<model>`로 표시되고, `agy/<model>`는 설정된 공급자를 선택합니다. 정식 공급자 이름은 계속 대소문자가 정확히 일치해야 하며, 인식되지 않는 접두사는 기존 모델 라우팅의 대체 경로를 따릅니다.
+
 ## 공급자 항목 (`OcxProviderConfig`)
 
 | 필드 | 타입 | 의미 |
@@ -93,7 +97,7 @@ managed map을 활성화하면 privacy-safe selector를 만들고, 이후 계정
 | `modelAutoCompactTokenLimits?` | `Record<string, number>` | 모델별 양의 안전 정수형 소프트 자동 압축 예산입니다. 유효한 컨텍스트 또는 최대 입력의 90% 한도를 낮출 수만 있으며, 신뢰할 수 있는 컨텍스트 창을 알 수 없으면 내보내지 않습니다. canonical `openai`에서는 키가 공급자나 계정 선택자 접두사가 없는 정확한 지원 네이티브 모델 ID여야 합니다. 공급자 PATCH는 항목을 병합하며, 키를 `null`로 지정하면 해당 키를 삭제하고 필드 전체를 `null`로 지정하면 맵을 지웁니다. 이 `null` tombstone은 PATCH에서만 사용할 수 있습니다. |
 | `defaultMaxOutputTokens?` | `number` | 클라이언트가 `max_output_tokens`를 생략했을 때 쓰는 공급자 전반의 `openai-chat` 폴백입니다. |
 | `modelMaxOutputTokens?` | `Record<string, number>` | 양수 모델별 `openai-chat` 폴백 예산입니다. 정확한 일치와 패턴 일치가 공급자 기본값보다 우선합니다. |
-| `modelCosts?` | `Record<string, Cost4>` | 모델별 표시 가격(100만 토큰당 USD). 해당 공급자의 정확한 업스트림 모델 ID를 키로 사용하며(공급자 식별자나 라우팅된 `provider/model` 레이블이 아님) 값은 `input`, `output`, `cacheRead`, `cacheWrite` 네 필드입니다(예: `{ "deepseek-v4-flash": { "input": 0.14, "output": 0.28, "cacheRead": 0.0028, "cacheWrite": 0 } }`). 커스텀 공급자는 `openai-chat` 어댑터로 임의의 OpenAI 호환 엔드포인트를 대상으로 할 수 있으며, 내장 카탈로그에 없는 로컬·내부 공급자 ID도 유효합니다. 사용자 구성 가격은 Logs `~$` 및 Usage 추정에서 내장 카탈로그보다 우선합니다. 기존 항목도 현재 오버레이로 다시 계산되므로 가격을 편집하면 과거 합계가 바뀔 수 있습니다(폴백 순서: 사용자 설정 → jawcode 카탈로그 → expected-price 오버레이 → 모델별 벤더 가격). 전부 0인 항목은 다음 소스로 폴백합니다. 각 요율은 0 이상의 유한한 숫자이며 최대 1,000,000(100만 토큰당 USD)입니다. 범위를 벗어난 행은 관리 경계에서 거부되고 로드 시 삭제됩니다. 표시 전용 추정이며 라우팅·계정 선택·할당량·청구에는 영향을 주지 않습니다. |
+| `modelCosts?` | `Record<string, Cost4>` | 모델별 표시 가격(100만 토큰당 USD). 해당 공급자의 정확한 업스트림 모델 ID를 키로 사용하며(공급자 식별자나 라우팅된 `provider/model` 레이블이 아님) 값은 `input`, `output`, `cacheRead`, `cacheWrite` 네 필드입니다(예: `{ "deepseek-v4-flash": { "input": 0.14, "output": 0.28, "cacheRead": 0.0028, "cacheWrite": 0 } }`). 커스텀 공급자는 `openai-chat` 어댑터로 임의의 OpenAI 호환 엔드포인트를 대상으로 할 수 있으며, 내장 카탈로그에 없는 로컬·내부 공급자 ID도 유효합니다. 사용자 구성 가격은 Logs `~$` 및 Usage 추정에서 내장 카탈로그보다 우선합니다. 기존 항목도 현재 오버레이로 다시 계산되므로 가격을 편집하면 과거 합계가 바뀔 수 있습니다(폴백 순서: 사용자 설정 → jawcode 카탈로그 → expected-price 오버레이 → 모델별 벤더 가격). 사용자가 모든 요율을 명시적으로 0으로 설정하면 비용을 0으로 추정합니다. 자동 가격으로 되돌리려면 해당 모델 항목을 삭제하세요. 카탈로그의 전부 0인 요율은 계속 다음 소스로 폴백합니다. 각 요율은 0 이상의 유한한 숫자이며 최대 1,000,000(100만 토큰당 USD)입니다. 범위를 벗어난 행은 관리 경계에서 거부되고 로드 시 삭제됩니다. 표시 전용 추정이며 라우팅·계정 선택·할당량·청구에는 영향을 주지 않습니다. |
 | `headers?` | `Record<string, string>` | 추가 상위 헤더입니다. Authorization, cookies, API-key 헤더, 내장 개행, 잘못된 이름은 허용하지 않습니다. |
 | `openRouterRouting?` | `OpenRouterProviderRouting` | 기본 OpenRouter `order`, `only`, `allowFallbacks` 선호도입니다. 정식 OpenRouter와 `openai-chat`에서만 유효합니다. |
 | `modelOpenRouterRouting?` | `Record<string, OpenRouterProviderRouting>` | 공급자 전반의 OpenRouter 선호도를 덮어쓰는 정확한 모델 id별 재정의입니다. |
@@ -400,6 +404,20 @@ Vercel AI Gateway는 하나의 모델을 여러 기반 추론 공급자에 걸�
   }
 }
 ```
+
+## 모델 표시 이름 편집기
+
+대시보드의 **Models**에서 발견된 모델의 읽기 쉬운 이름을 저장해 유지할 수 있습니다. 공급자를 펼치고 발견된 모델을
+찾아 **Name**을 선택하세요. 읽기 쉬운 이름을 저장하는 동안에도 대화 상자는 정확한 `provider/model`
+선택자를 표시합니다. **Reset name**을 선택하면 공급자 메타데이터 또는 기본 선택자 표시로 돌아갑니다.
+**Name**은 표시만 바꿉니다. 별도의 별칭 연필 아이콘은 짧은 라우팅 별칭을 바꾸며, 표시 이름 편집기가
+아닙니다. 네이티브 OpenAI와 사용자 지정 모델 행은 기존 조작 방식을 유지합니다.
+
+변경은 저장됐지만 새로고침에 실패하면 대화 상자는 저장된 재정의를 반영하고 **Retry**를 계속 제공합니다.
+서버가 카탈로그 수렴 실패를 보고했다면 Retry는 수렴을 다시 실행하고, 목록 요청만 실패했다면 목록을
+다시 불러옵니다. 초기화 후 복구는 초기화 작업을 유지하며 이전 이름을 복원하지 않습니다. 요청에는
+쓰기와 후속 목록 새로고침을 모두 포함하는 60초 제한이 있습니다. 시간 초과가 쓰기를 취소하지는 않습니다.
+다른 변경을 하기 전에 **Retry**로 현재 이름을 확인하세요.
 
 ## 전체 예시
 

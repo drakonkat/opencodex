@@ -52,6 +52,15 @@ describe("citation marker stripping (#3150)", () => {
     expect(stripCitationMarkers(`a${P}b`)).toBe(`a${P}b`);
     expect(stripCitationMarkers(`a${E}b`)).toBe(`a${E}b`);
   });
+
+  test("a malformed START before a later valid span is kept, not paired with that span's END", () => {
+    // Whole-string stripping must agree with the streaming filter: the malformed prefix
+    // survives and only the real span is removed (bridge re-strips the accumulated text
+    // for output_text.done, so any disagreement would make done != concatenated deltas).
+    const malformed = `${S}${"y".repeat(5_000)}`;
+    expect(stripCitationMarkers(`a${malformed}${S}cite${P}turn1view0${E} tail`)).toBe(`a${malformed} tail`);
+    expect(stripCitationMarkers(`a${S}cite${S}cite${P}turn1view0${E}b`)).toBe(`a${S}citeb`);
+  });
 });
 
 describe("streaming citation marker filter (#3150)", () => {
@@ -116,5 +125,29 @@ describe("streaming citation marker filter (#3150)", () => {
     expect(filter.push(`a${span}${malformed}${S}cite${P}turn1view0${E} tail`))
       .toBe(`a${malformed} tail`);
     expect(filter.flush()).toBe("");
+  });
+
+  test("concatenated streaming output equals whole-string stripping for every chunking", () => {
+    // The bridge emits deltas through the filter and then re-strips the accumulated text for
+    // output_text.done / output_item.done, so the two contracts must produce identical text.
+    const malformed = `${S}${"y".repeat(5_000)}`;
+    const inputs = [
+      `a${span}${malformed}${S}cite${P}turn1view0${E} tail`,
+      `kept ${S}cite${"x".repeat(5_000)}`,
+      `a${S}cite${S}cite${P}turn1view0${E}b`,
+      `a${span}b${S}cite${P}turn2view0${E}c`,
+      // An over-bound span that is eventually terminated: the streaming filter has already
+      // released it verbatim, so whole-string stripping must keep it too.
+      `late ${S}${"z".repeat(4_096)}${E} end`,
+      // Exactly at the bound (4096 chars START..END inclusive) is still a span.
+      `edge ${S}${"z".repeat(4_094)}${E} end`,
+    ];
+    for (const input of inputs) {
+      for (const size of [1, 7, 4_097, input.length]) {
+        const chunks: string[] = [];
+        for (let i = 0; i < input.length; i += size) chunks.push(input.slice(i, i + size));
+        expect(drain(chunks)).toBe(stripCitationMarkers(input));
+      }
+    }
   });
 });

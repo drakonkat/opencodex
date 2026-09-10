@@ -16,6 +16,7 @@ import { nativeContextLimits } from "../../codex/catalog";
 import { describeUpstreamConnectFailure } from "./upstream-error";
 import type { CodexWsQuotaObserver } from "./codex-ws-metadata";
 import { applyAccountQuotaFromUpstreamHeaders as applyCapturedCodexQuota } from "../../codex/quota";
+import { isCodexAccountGenerationLive } from "../../codex/account-store";
 import { isCodexWsQuotaObservedResponse } from "./ws-upstream";
 import {
   multiAgentGuidanceEnabled,
@@ -60,6 +61,10 @@ import {
   sameProviderContinuationOwner,
 } from "../../responses/provider-continuation";
 import {
+  rememberComboForLane,
+  recallComboForLane,
+} from "./combo-session-recall";
+import {
   comboRouteDecisionTrace,
   NoEligiblePolicyCandidateError,
   routeCompactionModel,
@@ -79,6 +84,7 @@ import {
   comboRequestHasImageInput,
   concreteComboRequestBody,
   getCombo,
+  resolveComboId,
   isComboTargetInCooldown,
   NoAvailableComboTargetsError,
   noteComboSuccess,
@@ -97,7 +103,7 @@ import {
 } from "../../lib/errors";
 import { injectionDebugLog } from "../../lib/injection-debug-log";
 import { resolveClientRetryAfter } from "../../lib/retry-after";
-import { enrichOpenCodeZenRateLimitMessage } from "../../providers/opencode-zen-rate-limit";
+import { enrichOpenCodeZenUpstreamMessage } from "../../providers/opencode-zen-rate-limit";
 import { CODE_MODE_EXEC_TOOL_NAME, modelInList, namespacedToolName } from "../../types";
 import type {
   AdapterEvent,
@@ -145,6 +151,11 @@ import {
 } from "../../oauth/generic-account-failover";
 import { resolveCopilotApiBaseUrl } from "../../oauth/github-copilot";
 import { buildWebSearchTool, planWebSearch, runWithWebSearch, shouldResolveOpenAiWebSearchSidecar } from "../../web-search";
+import {
+  createOllamaBridgeExecutor,
+  createPassthroughWebSearchBridgeStream,
+  planPassthroughWebSearchBridge,
+} from "../../web-search/passthrough-bridge";
 import { buildImageTool, buildVideoTool, planImageBridge, planVideoBridge, runWithImageBridge, clampImageMaxRounds, IMAGE_GEN_TOOL_NAME, VIDEO_GEN_TOOL_NAME } from "../../images";
 import { describeImagesInPlace, isModelTextOnly, planVisionSidecar, resolveOpenAiVisionModel, shouldResolveOpenAiVisionSidecar, stripImagesInPlace } from "../../vision";
 import { createAdapterEventQueue, preflightAdapterEvents, type AdapterEventQueue } from "../../adapters/run-turn-queue";
@@ -205,11 +216,14 @@ import {
 import {
   ForwardAdmissionCredentialError,
   hasForwardableCodexBearer,
+  isProxyAdmissionSecret,
   validateForwardAdmissionCredential,
 } from "../auth-cors";
 import type { DataPlaneAdmission } from "../auth-cors";
 import { createTranslatorBudget, isTranslatorBudgetExceededError, type TranslatorBudget } from "../../lib/translator-budget";
-import { listOpenAiForwardSidecarCandidates, resolveFirstUsableOpenAiSidecar, type ResolvedOpenAiForwardSidecar } from "../../providers/openai-sidecar";
+import { captureExplicitOpenAiCallerAuth, listOpenAiForwardSidecarCandidates, resolveFirstUsableOpenAiSidecar, type ExplicitOpenAiCallerAuth, type ResolvedOpenAiForwardSidecar } from "../../providers/openai-sidecar";
+import { inspectChatGptDomainClaim } from "../../oauth/chatgpt";
+import { captureCallerDirectAuth, providerConsumesCallerAuthorization, type CallerDirectAuth } from "../../providers/caller-authorization";
 import { isCanonicalOpenAiForwardProvider, OPENAI_CODEX_PROVIDER_ID } from "../../providers/openai-tiers";
 import { CODEX_RESERVE_HELPER_UNSUPPORTED_MESSAGE, isCodexReserveHelperUnsupported } from "../../codex/loopback-target";
 import { providerContextCap } from "../../providers/context-cap";
@@ -235,7 +249,13 @@ import { hasPassiveAccountQuota, recordAnthropicAccountQuotaFromHeaders, recordP
 import { captureConfigGeneration } from "../../lib/state-store-sweeper";
 import { applyOpenAiVirtualModel, resolveOpenAiCompactModel } from "../../providers/openai-virtual-models";
 import { isUsageDebugEnabled } from "../../usage/debug";
-import { readJsonRequestBody, DecompressedBodyTooLargeError, UnsupportedContentEncodingError } from "../request-decompress";
+import {
+  readJsonRequestBody,
+  describeInboundBodyRefusal,
+  resolveInboundBodyLimitBytes,
+  DecompressedBodyTooLargeError,
+  UnsupportedContentEncodingError,
+} from "../request-decompress";
 import { resolveAdapter, resolveWireProtocolOverride } from "../adapter-resolve";
 import {
   providerModelResponsesTerminalRepair,
@@ -271,7 +291,7 @@ import {
   upstreamErrorMessageFromPayload,
 } from "../../lib/errors";
 import type { AdmissionLease } from "../../lib/admission";
-import { supportedLadderFor } from "../effort-policy";
+import { prepareEffortNormalization, supportedLadderFor } from "../effort-policy";
 import { isThreadSpawnRequest } from "../effort-policy";
 import {
   applySubagentModelFallback,
@@ -311,6 +331,7 @@ import {
   consumeForInspection,
   consumeForResponseLogMetadata,
   createSseInspector,
+  terminalStatusFromParsed,
   isEagerRelaySseResponse,
   isNativePassthroughSseResponse,
   markEagerRelaySseResponse,
@@ -341,6 +362,7 @@ import {
 } from "../responses-item-id-repair";
 import {
   createReasoningSummaryChannelPayloadRewrite,
+  rewriteReasoningSummaryInJson,
   rewriteReasoningSummaryInJsonString,
   routeUsesContentChannelReasoning,
 } from "../responses-reasoning-summary-rewrite";
@@ -414,7 +436,7 @@ import {
 } from "../responses-undeclared-tool-guard";
 import { createGithubCopilotResponsesBlockRewrite } from "../github-copilot-responses-repair";
 import { responsesJsonToSseStream } from "../responses-json-events";
-import { streamingContextOverflowResponse } from "./context-overflow";
+import { jsonContextOverflowResponse, streamingContextOverflowResponse } from "./context-overflow";
 import { guardTerminalEventStream } from "./terminal-guard";
 import {
   emptyCompletionRetryEnabled,
@@ -1002,11 +1024,15 @@ export function usesCodexForwardPoolAuth(
     && provider.authMode === "forward" && provider.adapter === "openai-responses";
 }
 
-function codexWsQuotaObserver(authCtx: CodexAuthContext, provider: OcxProviderConfig): CodexWsQuotaObserver | undefined {
+function codexWsQuotaObserver(authCtx: CodexAuthContext, provider: OcxProviderConfig, modelId?: string): CodexWsQuotaObserver | undefined {
   if (!isCanonicalOpenAiForwardProvider(provider) || !usesCodexForwardPoolAuth(authCtx, provider)) return undefined;
   const { accountId, writerGeneration } = authCtx;
+  const credentialGeneration = authCtx.kind === "pool" ? authCtx.generation : undefined;
   const mainWriter = authCtx.kind === "main-pool" ? authCtx.mainQuotaWriter : undefined;
-  return headers => applyCapturedCodexQuota(accountId, headers, writerGeneration, mainWriter);
+  return headers => {
+    if (credentialGeneration !== undefined && !isCodexAccountGenerationLive(accountId, credentialGeneration)) return;
+    applyCapturedCodexQuota(accountId, headers, writerGeneration, mainWriter, { modelId });
+  };
 }
 
 export function preAuthUpstreamHostCircuitKey(
@@ -1110,7 +1136,8 @@ export async function shouldRetryCodexPoolAccountQuota(
 }
 
 interface CodexPoolAccountRetryArgs {
-  req: Request;
+  /** Sanitized caller input, before any selected Pool credential was materialized. */
+  callerAuthHeaders: Headers;
   config: OcxConfig;
   route: { providerName: string; modelId: string; provider: OcxProviderConfig };
   parsed: OcxParsedRequest;
@@ -1276,7 +1303,7 @@ async function retryCodexPoolOnAlternateAccount(
   args: CodexPoolAccountRetryArgs,
 ): Promise<CodexPoolAccountRetryResult> {
   const {
-    req, config, route, parsed, logCtx, options, firstAuthCtx, firstResponse,
+    callerAuthHeaders, config, route, parsed, logCtx, options, firstAuthCtx, firstResponse,
     outcomeStatus, upstream, connectMs, passthroughEstimate, stream,
   } = args;
   const inboundWire = options.inboundWire ?? "responses";
@@ -1310,7 +1337,7 @@ async function retryCodexPoolOnAlternateAccount(
   }
   try {
     retryAuthCtx ??= await resolveCodexAuthContext(
-        req.headers,
+        callerAuthHeaders,
         config,
         "pool",
         {
@@ -1318,7 +1345,7 @@ async function retryCodexPoolOnAlternateAccount(
           admission: options.admission,
           codexAuthPolicy: options.codexAuthPolicy,
           modelId: route.modelId,
-          requestScopedMainCredential: hasForwardableCodexBearer(req.headers, config),
+          requestScopedMainCredential: hasForwardableCodexBearer(callerAuthHeaders, config),
           beginCodexAccountSelection: codexAccountSelectionForTurn(options.turnAdmissionLease),
           resolveCodexModelEntitlements: entitlementResolver,
         },
@@ -1367,6 +1394,7 @@ async function retryCodexPoolOnAlternateAccount(
       firstResponse.headers,
       firstAuthCtx.writerGeneration,
       firstAuthCtx.kind === "main-pool" ? firstAuthCtx.mainQuotaWriter : undefined,
+      { modelId: route.modelId },
     );
   }
   const deferFirstOutcome = shouldDeferCodexResetDerivedCooldown(
@@ -1388,7 +1416,7 @@ async function retryCodexPoolOnAlternateAccount(
   // Only a combo reset-derived outcome is deferred. Retry-After, defaults, and
   // ordinary requests must block the first account before the alternate send.
   if (!deferFirstOutcome) recordFirstOutcome();
-  const retryHeaders = headersForCodexAuthContext(req.headers, retryAuthCtx, options.codexAuthPolicy ?? config, route.modelId, options.admission);
+  const retryHeaders = headersForCodexAuthContext(callerAuthHeaders, retryAuthCtx, options.codexAuthPolicy ?? config, route.modelId, options.admission);
   const retryProvider = applyCodexAuthContextToProvider(
     stripCodexRuntimeProviderFields(route.provider),
     retryAuthCtx,
@@ -1458,7 +1486,7 @@ async function retryCodexPoolOnAlternateAccount(
           providerFetch(route.provider, options.codexWsRuntimeIdentity, {
             providerName: route.providerName,
             modelId: route.modelId,
-            onCodexWsQuota: codexWsQuotaObserver(retryAuthCtx, route.provider),
+            onCodexWsQuota: codexWsQuotaObserver(retryAuthCtx, route.provider, route.modelId),
             beforeDispatch: isCanonicalOpenAiForwardProvider(route.provider)
               ? createCodexReserveDispatchGuard(retryAuthCtx, options.codexAuthPolicy ?? config, route.modelId, options.admission, options.visionDescribeTerminal === true) : undefined,
           }),
@@ -1592,7 +1620,7 @@ export function decodeRequestErrorResponse(err: unknown, label: string): Respons
     return formatErrorResponse(415, "invalid_request_error", err.message);
   }
   if (err instanceof DecompressedBodyTooLargeError) {
-    return formatErrorResponse(413, "invalid_request_error", err.message);
+    return formatErrorResponse(413, "inbound_body_too_large", describeInboundBodyRefusal(err));
   }
   console.warn(`[${label}] request body decode/parse failed: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`);
   return formatErrorResponse(400, "invalid_request_error", "Invalid JSON body");
@@ -1662,6 +1690,8 @@ export interface HandleResponsesOptions {
   onCodexAuthContextResolved?: (context: CodexAuthContext | undefined) => void;
   /** Internal deterministic seam for account-gated native fallback tests. */
   resolveCodexModelEntitlements?: typeof resolveCodexModelEntitlements;
+  /** Internal: validated final client-visible model, after completed terminal success only. */
+  onResponseComplete?: (model: string) => void;
   recordTerminalOutcomes?: boolean;
   setTerminalOutcomeRecorder?: (recorder: ((status: ResponsesTerminalStatus, httpStatusOverride?: number) => void) | undefined) => void;
   onNativePassthroughTerminal?: (status: ResponsesTerminalStatus) => void;
@@ -1690,9 +1720,17 @@ export interface HandleResponsesOptions {
   /**
    * Claude replay may add native-main auth so OpenAI sidecars remain available.
    * Strip only that internal credential when the final route is a noncanonical
-   * forward destination; final routing can differ from Claude's preflight route.
+   * forward/caller-auth destination; final routing can differ from Claude's preflight route.
    */
   stripClaudeMainAuthForNoncanonicalForward?: boolean;
+  /** In-memory credential proven by Claude's native-main turn claim; never persist or log. */
+  trustedClaudeMainAuth?: { authorization: string; chatgptAccountId?: string };
+  /** Sidecar-only auth captured before route changes; null means no usable original pair. */
+  openAiSidecarAuth?: ExplicitOpenAiCallerAuth | null;
+  /** Original caller-owned native pair; separate from any claimed sidecar enrichment. */
+  nativeCallerAuth?: ExplicitOpenAiCallerAuth | null;
+  /** Caller Direct credential under Direct\'s own predicate; restored only for the canonical OpenAI final route. */
+  callerDirectAuth?: CallerDirectAuth | null;
   /** Internal recursion guard; callers outside this module must not set it. */
   comboAttempt?: boolean;
   /** Internal combo handoff for one parent-validated continuation snapshot. */
@@ -1862,36 +1900,59 @@ export function createChildPassthroughCallbackGate(options: HandleResponsesOptio
   let state: "pending" | "committed" | "discarded" = "pending";
   let pending: Pending | undefined;
   let accepted = false;
+  let pendingModel: string | undefined;
+  let completionAccepted = false;
+  let completionRejected = false;
   const publish = (value: Pending): void => {
     if (value.kind === "terminal") options.onNativePassthroughTerminal?.(value.status);
     else options.onNativePassthroughCancel?.();
   };
+  const publishCompletion = (): void => {
+    if (state !== "committed" || completionRejected || pendingModel === undefined) return;
+    const model = pendingModel;
+    pendingModel = undefined;
+    options.onResponseComplete?.(model);
+  };
   const receive = (value: Pending): void => {
     if (state === "discarded" || accepted) return;
     accepted = true;
+    if (value.kind === "cancel" || value.status !== "completed") {
+      completionRejected = true;
+      pendingModel = undefined;
+    }
     if (state === "committed") return publish(value);
     pending ??= value;
   };
   return {
     onTerminal: (status: ResponsesTerminalStatus) => receive({ kind: "terminal", status }),
     onCancel: () => receive({ kind: "cancel" }),
+    onResponseComplete: (model: string) => {
+      if (state === "discarded" || completionRejected || completionAccepted || !model.trim()) return;
+      completionAccepted = true;
+      pendingModel = model;
+      publishCompletion();
+    },
     commit: () => {
       if (state !== "pending") return;
       state = "committed";
       if (pending) publish(pending);
       pending = undefined;
+      publishCompletion();
     },
     discard: () => {
       state = "discarded";
       pending = undefined;
+      pendingModel = undefined;
     },
   };
 }
 
 
-
 export function buildComboChildHeaders(parentHeaders: HeadersInit): Headers {
   const childHeaders = new Headers(parentHeaders);
+  // A provisional caller credential is not authoritative for a Combo child.
+  childHeaders.delete("authorization");
+  childHeaders.delete("chatgpt-account-id");
   // Combo children re-serialize already-decoded JSON. Keeping transport metadata from
   // the parent would make the child decoder treat plain JSON as compressed bytes.
   childHeaders.delete("content-length");
@@ -1976,7 +2037,7 @@ function canPassThroughEncryptedV2AgentTask(
 }
 
 type ResponsesAuthResolution =
-  | { ok: true; authCtx: CodexAuthContext; headers: Headers; substituteMainCredential: boolean }
+  | { ok: true; authCtx: CodexAuthContext; headers: Headers; callerAuthHeaders: Headers; substituteMainCredential: boolean }
   | { ok: false; response: Response };
 
 /**
@@ -1988,8 +2049,75 @@ async function resolveResponsesCodexAuth(
   config: OcxConfig,
   route: RouteResult,
   options: HandleResponsesOptions,
+  credentialDomainWasRewritten = false,
 ): Promise<ResponsesAuthResolution> {
   try {
+    const routeMayChangeCredentialDomain = options.comboAttempt === true
+      || route.routeKind === "policy"
+      || credentialDomainWasRewritten;
+    const trustedClaudeMainForFinalRoute = options.stripClaudeMainAuthForNoncanonicalForward === true
+      && isCanonicalOpenAiForwardProvider(route.provider)
+      ? options.trustedClaudeMainAuth : undefined;
+    let authInputHeaders = req.headers;
+    // Route-changing recursion retains typed admission, never an unscoped raw
+    // caller credential. Bearer admission is substituted or stripped below.
+    if (routeMayChangeCredentialDomain && options.admission?.source !== "bearer"
+      && !trustedClaudeMainForFinalRoute) {
+      authInputHeaders = new Headers(req.headers);
+      authInputHeaders.delete("authorization");
+      authInputHeaders.delete("chatgpt-account-id");
+    }
+    if (trustedClaudeMainForFinalRoute) {
+      authInputHeaders = new Headers(authInputHeaders);
+      authInputHeaders.set("authorization", trustedClaudeMainForFinalRoute.authorization);
+      if (trustedClaudeMainForFinalRoute.chatgptAccountId) {
+        authInputHeaders.set("chatgpt-account-id", trustedClaudeMainForFinalRoute.chatgptAccountId);
+      } else {
+        authInputHeaders.delete("chatgpt-account-id");
+      }
+    }
+    // A caller-auth transport that is not canonical OpenAI (keyless Cursor) consumes the
+    // caller's Authorization as its own upstream token. Keep that contract only for a clean
+    // single bearer with NO ChatGPT-domain marker. A bearer marked for the ChatGPT domain —
+    // whether its marker is valid or malformed/conflicting — a combined/malformed value, or
+    // the captured explicit OpenAI pair is never a Cursor token; a foreign JWT carrying only
+    // a generic organizations claim is not ChatGPT-marked and keeps the legacy contract.
+    // chatgpt-account-id has no meaning outside the ChatGPT domain.
+    if (!isCanonicalOpenAiForwardProvider(route.provider)
+      && providerConsumesCallerAuthorization(route.provider)) {
+      const rawAuth = authInputHeaders.get("authorization")?.trim();
+      const singleBearer = /^Bearer[\t ]+([^\s,]+)$/i.exec(rawAuth ?? "")?.[1];
+      const domainClaim = singleBearer ? inspectChatGptDomainClaim(singleBearer) : { kind: "absent" as const };
+      const dropBearer = options.nativeCallerAuth != null || domainClaim.kind !== "absent"
+        || (rawAuth !== undefined && singleBearer === undefined);
+      if (dropBearer || authInputHeaders.has("chatgpt-account-id")) {
+        const scoped = new Headers(authInputHeaders);
+        if (dropBearer) scoped.delete("authorization");
+        scoped.delete("chatgpt-account-id");
+        authInputHeaders = scoped;
+      }
+    }
+    // The caller's own Direct credential may cross an internal route change only to the
+    // canonical OpenAI transport, under a predicate deliberately STRICTER than plain
+    // unchanged-route Direct forwarding: a clean non-proxy bearer whose ChatGPT-domain
+    // marker is valid, with any explicit account header matching that marker. Unchanged
+    // routes keep their legacy rules; sidecar enrichment grants no primary authority.
+    if (options.callerDirectAuth && isCanonicalOpenAiForwardProvider(route.provider)) {
+      const directHeaders = new Headers({
+        authorization: options.callerDirectAuth.authorization,
+        ...(options.callerDirectAuth.chatgptAccountId
+          ? { "chatgpt-account-id": options.callerDirectAuth.chatgptAccountId } : {}),
+      });
+      if (captureCallerDirectAuth(directHeaders, config)) {
+        authInputHeaders = new Headers(authInputHeaders);
+        authInputHeaders.set("authorization", options.callerDirectAuth.authorization);
+        if (options.callerDirectAuth.chatgptAccountId) {
+          authInputHeaders.set("chatgpt-account-id", options.callerDirectAuth.chatgptAccountId);
+        } else {
+          authInputHeaders.delete("chatgpt-account-id");
+        }
+      }
+    }
     // #1686: a caller that proved admission with a BEARER presented one of our own secrets.
     // Refusing it here is what made the codex-cli `env_key` contract unusable against Direct.
     // Admitting it is only safe because the stored main credential is substituted below, so
@@ -2013,15 +2141,16 @@ async function resolveResponsesCodexAuth(
     // no-ChatGPT-login install keeps working.
     const substituteMainCredential = options.admission?.source === "bearer"
       && (route.codexAccountMode !== undefined || isCanonicalOpenAiForwardProvider(route.provider));
+    const stripAuthorization = options.admission?.source === "bearer" && !substituteMainCredential;
     const requestScopedMainCredential = route.codexAccountMode !== undefined
       && !substituteMainCredential
-      && hasForwardableCodexBearer(req.headers, config);
+      && hasForwardableCodexBearer(authInputHeaders, config);
     if (route.codexAccountMode === "direct" && !substituteMainCredential) {
-      validateForwardAdmissionCredential(req.headers, config);
+      validateForwardAdmissionCredential(authInputHeaders, config);
     }
     let authCtx: CodexAuthContext;
     if (route.codexAccountMode) {
-      authCtx = await resolveCodexAuthContext(req.headers, config, route.codexAccountMode, {
+      authCtx = await resolveCodexAuthContext(authInputHeaders, config, route.codexAccountMode, {
         admission: options.admission,
         codexAuthPolicy: options.codexAuthPolicy,
         accountId: route.codexAccountId,
@@ -2057,7 +2186,7 @@ async function resolveResponsesCodexAuth(
     // (custom-named canonical-forward providers must retain the same protection).
     const mainPolicyConfig = isCanonicalOpenAiForwardProvider(route.provider)
       ? options.codexAuthPolicy ?? config : undefined;
-    const headers = await materializeCodexUpstreamAuthAsync(req.headers, authCtx, {
+    const headers = await materializeCodexUpstreamAuthAsync(authInputHeaders, authCtx, {
       admission: options.admission,
       config: mainPolicyConfig,
       modelId: route.modelId,
@@ -2076,10 +2205,27 @@ async function resolveResponsesCodexAuth(
         response: formatErrorResponse(401, "authentication_error", "Selected Codex account needs reauthentication"),
       };
     }
+    if (stripAuthorization) {
+      headers.delete("authorization");
+      headers.delete("chatgpt-account-id");
+    }
+    if (providerConsumesCallerAuthorization(route.provider) && options.admission?.source !== undefined
+      && options.admission.source !== "loopback") {
+      validateForwardAdmissionCredential(headers, config);
+    } else {
+      // Even adapters that ignore caller auth must not retain a proxy secret for
+      // a later internal hop or a future transport change.
+      const bearer = headers.get("authorization")?.replace(/^Bearer\s+/i, "").trim();
+      if (bearer && isProxyAdmissionSecret(bearer, config)) {
+        headers.delete("authorization");
+        headers.delete("chatgpt-account-id");
+      }
+    }
     return {
       ok: true,
       authCtx,
       headers,
+      callerAuthHeaders: new Headers(authInputHeaders),
       substituteMainCredential,
     };
   } catch (err) {
@@ -2281,6 +2427,7 @@ async function applyFinalRouteRequestNormalization(args: {
   inboundTransport?: "websocket";
 }): Promise<void> {
   const { parsed, route, config, req, logCtx, inboundWire, inboundTransport } = args;
+  const effortSelector = prepareEffortNormalization(parsed, route);
 
   // Only Anthropic message routes retain the Codex-facing selector. Other providers must keep
   // their existing response.model contract even when their public and wire model ids differ.
@@ -2305,7 +2452,8 @@ async function applyFinalRouteRequestNormalization(args: {
 
   // Settle the wire once so logging, fast-mode, auth, and sidecars read the adapter
   // this request will actually use (#404).
-  route.provider = resolveOpenCodeGoTransport(route.provider, sessionLaneIdFromRequest(req.headers));
+  route.provider = resolveOpenCodeGoTransport(route.provider,
+    sessionLaneIdFromRequest(req.headers) ?? normalizeLogConversationId(req.headers.get("x-opencode-session")));
   route.provider = resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire);
   if (preserveAnthropicResponseModel) parsed._responseModelId = responseModelId;
   logCtx.model = route.modelId;
@@ -2400,6 +2548,17 @@ async function applyFinalRouteRequestNormalization(args: {
       }
     } else if (isInjectionDebugEnabled() && collabSurface(parsed) !== null) {
       injectionDebugLog(`[opencodex] ${route.modelId}: collab surface=${collabSurface(parsed)}, guidance silent (effort=${parsed.options.reasoning ?? "unset"}, injectionModel=${config.injectionModel ?? "unset"})`);
+    }
+  }
+
+  {
+    const { applyPinnedEffort } = await import("../effort-policy");
+    const pinned = applyPinnedEffort(parsed, route, config, effortSelector);
+    if (pinned) {
+      logCtx.requestedEffort = pinned.from ? `${pinned.from}->${pinned.to}` : pinned.to;
+      if (isInjectionDebugEnabled()) {
+        injectionDebugLog(`[opencodex] ${route.modelId}: pinned reasoning effort applied (${pinned.from ?? "none"} -> ${pinned.to})`);
+      }
     }
   }
 
@@ -2633,6 +2792,10 @@ export async function handleComboResponses(
   logCtx.routeDecision = comboRouteDecisionTrace(config, comboId, pick, requestedModel);
 
   let lastFailure: Response | null = null;
+  // The exhausted-combo mapping below runs outside the loop, where `failure.upstreamCode`
+  // is gone, so carry the loop's own classification decision instead of re-deriving a
+  // weaker one from the status alone (#4149).
+  let lastFailureClassifiesOverflow = false;
   while (pick) {
     if (options.abortSignal?.aborted) return clientCancelledResponse();
     const childLog: RequestLogContext = {
@@ -2677,9 +2840,22 @@ export async function handleComboResponses(
       (logCtx.attempts ??= []).push(attempt);
       attemptRetained = true;
     };
+    const completedTarget = { provider: pick.target.provider, model: pick.target.model };
+    const writerGeneration = pick.writerGeneration;
     let consumedChildFailure: ConsumedComboFailure | undefined;
     const callbackGate = createChildPassthroughCallbackGate({
       ...options,
+      onResponseComplete: model => {
+        // The live config can change while the child is streaming. Never retain credentials.
+        const currentCombo = getCombo(config, comboId);
+        const provider = config.providers[completedTarget.provider];
+        if (Object.hasOwn(config.providers, completedTarget.provider)
+          && provider && provider.disabled !== true
+          && currentCombo?.targets.some(target => targetKey(target) === targetKey(completedTarget))) {
+          rememberComboForLane(sessionLaneIdFromRequest(req.headers), comboId, completedTarget, model, writerGeneration);
+        }
+        options.onResponseComplete?.(model);
+      },
       onNativePassthroughTerminal: status => {
         // A committed stream can acquire terminal metadata after preflight copied
         // the child log. Publish it before the outer logger finalizes, but only
@@ -2720,6 +2896,7 @@ export async function handleComboResponses(
         onStoredPool401ReplayDispatched: () => { storedPool401ReplayDispatched = true; },
         onNativePassthroughTerminal: callbackGate.onTerminal,
         onNativePassthroughCancel: callbackGate.onCancel,
+        onResponseComplete: callbackGate.onResponseComplete,
       });
     } catch (error) {
       callbackGate.discard();
@@ -2826,6 +3003,12 @@ export async function handleComboResponses(
     const failureDecision = comboFailureDecision(failure.response.status, failure.classificationText, {
       code: failure.upstreamCode,
     });
+    const wantsStream = (rawBody as { stream?: unknown } | null)?.stream === true;
+    // Local byte admission has its own diagnostic; do not relabel it as an upstream refusal.
+    const classifyOverflow = failure.response.status === 413
+      && (wantsStream || (failure.upstreamCode !== "outbound_body_too_large"
+        && failure.upstreamCode !== "translation_buffer_limit"));
+    lastFailureClassifiesOverflow = classifyOverflow;
     if (storedPool401ReplayDispatched) {
       if (failureDecision === "hop" && unreadableEncryptedAgentTask && !comboPayloadReadable) {
         const recoveredTarget = await pickWithWait({
@@ -2850,15 +3033,19 @@ export async function handleComboResponses(
       // Keep the spent Pool budget sticky even after a recovered routed child:
       // no later failure may reopen ordinary combo/native account hopping.
       adoptFailedChildLog(childLog);
+      if (classifyOverflow && failureDecision === "stop") {
+        return wantsStream
+          ? streamingContextOverflowResponse(requestedModel, options.translatorBudget)
+          : jsonContextOverflowResponse();
+      }
       return lastFailure;
     }
     if (failureDecision === "stop") {
       adoptFailedChildLog(childLog);
-      if (
-        failure.response.status === 413
-        && (rawBody as { stream?: unknown } | null)?.stream === true
-      ) {
-        return streamingContextOverflowResponse(requestedModel, options.translatorBudget);
+      if (classifyOverflow) {
+        return wantsStream
+          ? streamingContextOverflowResponse(requestedModel, options.translatorBudget)
+          : jsonContextOverflowResponse();
       }
       return lastFailure;
     }
@@ -2908,9 +3095,11 @@ export async function handleComboResponses(
   }
   if (
     lastFailure?.status === 413
-    && (rawBody as { stream?: unknown } | null)?.stream === true
+    && lastFailureClassifiesOverflow
   ) {
-    return streamingContextOverflowResponse(requestedModel, options.translatorBudget);
+    return (rawBody as { stream?: unknown } | null)?.stream === true
+      ? streamingContextOverflowResponse(requestedModel, options.translatorBudget)
+      : jsonContextOverflowResponse();
   }
   return lastFailure!;
 }
@@ -3024,6 +3213,12 @@ export async function handleResponses(
   try {
     const response = await handleResponsesInner(req, config, logCtx, {
       ...options,
+      openAiSidecarAuth: options.openAiSidecarAuth === undefined
+        ? captureExplicitOpenAiCallerAuth(req.headers, config) : options.openAiSidecarAuth,
+      nativeCallerAuth: options.nativeCallerAuth === undefined
+        ? captureExplicitOpenAiCallerAuth(req.headers, config) : options.nativeCallerAuth,
+      callerDirectAuth: options.callerDirectAuth === undefined
+        ? captureCallerDirectAuth(req.headers, config) : options.callerDirectAuth,
       // Capture before combo replay rebuilds the Request headers; children carry options.
       visionDescribeTerminal: options.visionDescribeTerminal === true
         || req.headers.get("x-opencodex-vision-describe") === "1",
@@ -3056,7 +3251,7 @@ async function handleResponsesInner(
   const agentTaskRecovery = agentTaskRecoveryConfig(config);
   let body: unknown;
   try {
-    body = await readJsonRequestBody(req, translatorBudget);
+    body = await readJsonRequestBody(req, translatorBudget, resolveInboundBodyLimitBytes(config.maxInboundBodyBytes));
   } catch (err) {
     if (options.abortSignal?.aborted || req.signal.aborted) {
       return clientCancelledResponse();
@@ -3091,6 +3286,47 @@ async function handleResponsesInner(
         : {}),
       effort: comboEffortRow.effort,
     };
+  }
+  // Compaction may send the last client-visible bare model after a combo switch.
+  // Configured selectors take precedence; otherwise recall before combo dispatch (#3891).
+  if (!options.comboAttempt && body && typeof body === "object" && !Array.isArray(body)) {
+    const rawModel = (body as { model?: unknown }).model;
+    const rawInput = (body as { input?: unknown }).input;
+    const isCompactionTrigger = Array.isArray(rawInput)
+      && rawInput.some((item: unknown) =>
+        typeof item === "object" && item !== null && (item as { type?: string }).type === "compaction_trigger");
+    if (typeof rawModel === "string" && !rawModel.includes("/") && isCompactionTrigger
+      && !comboRows.fastRow && !comboEffortRow
+      && !resolveComboId(config, rawModel)) {
+      const recalledComboId = recallComboForLane(config, sessionLaneIdFromRequest(req.headers), rawModel);
+      if (recalledComboId) {
+        (body as Record<string, unknown>).model = `combo/${recalledComboId}`;
+      }
+    }
+  }
+  // A shadow-call replacement that names a COMBO is routing policy, not the identity of any
+  // one pick. The late intercept site below resolves it through routeModel/tryPickComboModel,
+  // which collapses the table to a single target while still tagging `routeKind: "combo"`, so
+  // the combo gate on the next line never fires, handleComboResponses never runs, and 429/5xx
+  // hops — which only exist inside that loop — are unreachable (#4129). Rewrite the selector
+  // here instead, before comboIdFromRawBody reads `model`, and identify the combo by CONFIG
+  // LOOKUP so the check can never observe a one-candidate collapse.
+  if (!options.comboAttempt && body && typeof body === "object" && !Array.isArray(body)) {
+    const shadowIntercept = config.shadowCallIntercept;
+    const rawShadowModel = (body as { model?: unknown }).model;
+    if (shadowIntercept?.enabled && shadowIntercept.model && typeof rawShadowModel === "string"
+      && isShadowSourceModel(rawShadowModel, shadowIntercept.sourceModels)) {
+      const shadowComboId = resolveComboId(config, shadowIntercept.model);
+      if (shadowComboId && Object.hasOwn(config.combos ?? {}, shadowComboId)) {
+        (body as Record<string, unknown>).model = shadowIntercept.model;
+        // Same rule as the late intercept site: record the operator-configured prefix that
+        // matched, never the caller's raw model string. Matching is by prefix, so the raw
+        // value is caller-controlled and reaches usage.jsonl and /api/logs.
+        logCtx.shadowCallRewrittenFrom = sanitizeLogMetadataString(
+          shadowSourceModelPrefix(rawShadowModel, shadowIntercept.sourceModels),
+        );
+      }
+    }
   }
   const comboId = !options.comboAttempt ? comboIdFromRawBody(body, config) : null;
   if (comboId && Object.hasOwn(config.combos ?? {}, comboId)) {
@@ -3253,6 +3489,7 @@ async function handleResponsesInner(
   logCtx.configuredSpeedLabel = requestLogSpeedLabel(logCtx.configuredServiceTier);
 
   let route: RouteResult;
+  let credentialDomainWasRewritten = false;
   try {
     // A `compaction_trigger` turn may name a bare native model the operator has
     // no canonical OpenAI route for (#2901). Only the initial compaction route
@@ -3274,6 +3511,7 @@ async function handleResponsesInner(
       } catch { /* Native Codex helper calls remain OpenAI-owned without an enabled OpenAI route. */ }
       const targetRoute = resolveRoute(_sci.model);
       if (shouldInterceptShadowCall(parsed.modelId, _sci.sourceModels, sourceIdentity, targetRoute)) {
+        credentialDomainWasRewritten = true;
         const _sciOriginal = parsed.modelId;
         parsed.modelId = _sci.model;
         if (parsed._rawBody && typeof parsed._rawBody === "object") {
@@ -3405,6 +3643,7 @@ async function handleResponsesInner(
     if (fallback?.to && !slugsEquivalent(fallback.to, route.modelId)) {
       try {
         route = routeModel(config, fallback.to, evidenceFromBody(parsed._rawBody));
+        credentialDomainWasRewritten = true;
         logCtx.routeDecision = route.routeDecision;
       } catch (err) {
         if (err instanceof NoAvailableComboTargetsError) {
@@ -3424,10 +3663,19 @@ async function handleResponsesInner(
   let recoveryFailureReason: AgentTaskRecoveryFailureReason | undefined;
   // Native fallback and explicitly trusted direct Responses routes can consume ciphertext,
   // so recover only after final route selection.
+  //
+  // Deliberately NOT gated on `threadSpawn` (#4089). Switching a live thread from a native
+  // ChatGPT model to a routed provider replays a backend-minted encrypted agent message on every
+  // later turn, and a model switch is not a spawn, so the spawn requirement failed the thread
+  // closed permanently without ever attempting recovery. The trust boundary is
+  // `recoveryAdmission()` in ./agent-task-recovery -- Codex originator, live native ChatGPT
+  // bearer, matching chatgpt-account-id, no inbound API key, no proxy-admission secret -- which
+  // admits only the owner of the session that would be spent. `threadSpawn` narrowed which of
+  // that owner's own requests could use their own session; it kept nobody else out. The combo
+  // gate above keeps its spawn requirement: that path has its own native-target filtering and
+  // per-attempt failover, and the reported defect is on this path.
   if (
     inboundWire === "responses"
-    &&
-    threadSpawn
     && agentTaskRecovery
     && !isCanonicalOpenAiForwardProvider(route.provider)
     && !options.comboAttempt
@@ -3541,6 +3789,7 @@ async function handleResponsesInner(
           if (fallback?.to && !slugsEquivalent(fallback.to, route.modelId)) {
             try {
               route = routeModel(config, fallback.to, evidenceFromBody(parsed._rawBody));
+              credentialDomainWasRewritten = true;
               logCtx.routeDecision = route.routeDecision;
             } catch (err) {
               if (err instanceof NoAvailableComboTargetsError) {
@@ -3581,14 +3830,16 @@ async function handleResponsesInner(
   // The canonical ChatGPT backend rejects previous_response_id, so a local replay miss leaves no
   // safe way to recover the omitted history. Fail before auth, adapter construction, or upstream
   // I/O instead of stripping the id and silently forwarding a context-free delta (#702).
+  // Codex recognizes previous_response_not_found on WebSocket errors and reconnects with its
+  // full input. A generic invalid_request_error instead terminates the task after cache expiry.
   if (
     hasUnexpandedPreviousResponse
     && isCanonicalOpenAiForwardProvider(route.provider)
   ) {
     return formatErrorResponse(
       400,
-      "invalid_request_error",
-      "OpenAI forward continuation state is unavailable or expired; start a new session instead of reusing this previous_response_id.",
+      "previous_response_not_found",
+      "OpenAI forward continuation state is unavailable or expired; resend the full conversation without previous_response_id.",
     );
   }
 
@@ -3669,11 +3920,13 @@ async function handleResponsesInner(
   }
 
   let substituteMainCredential = false;
+  let callerAuthHeaders: Headers;
   {
-    const finalAuth = await resolveResponsesCodexAuth(req, config, route, options);
+    const finalAuth = await resolveResponsesCodexAuth(req, config, route, options, credentialDomainWasRewritten);
     if (!finalAuth.ok) return finalAuth.response;
     authCtx = finalAuth.authCtx;
     selectedForwardHeaders = finalAuth.headers;
+    callerAuthHeaders = finalAuth.callerAuthHeaders;
     substituteMainCredential = finalAuth.substituteMainCredential;
   }
 
@@ -3699,6 +3952,7 @@ async function handleResponsesInner(
     || route.providerName === "github-copilot"
     || route.providerName === "kiro"
     || route.providerName === "google-antigravity"
+    || route.providerName === "orcarouter-oauth"
   ) && route.provider.authMode === "oauth";
   let sentOAuthSnapshot: OAuthAccessSnapshot | undefined;
   let replayOAuthCredentialSnapshot: Pick<OAuthAccessSnapshot, "accountId" | "generation"> | undefined;
@@ -3962,7 +4216,8 @@ async function handleResponsesInner(
           const ownsBearer = snapshot !== undefined
             && sentHeaders?.get("authorization") === `Bearer ${snapshot.accessToken}`
             && !sentHeaders?.has("x-api-key");
-          const response = await fetchImpl(destination, dispatchInit);
+          // Reselection can choose a provider override instead of the supplied executor.
+          const response = await fetchImpl(destination, { ...dispatchInit, redirect: "manual" });
           // Observe each physical response before retries replace it. The binding belongs to
           // this dispatch, so a manual switch cannot file A's headers against B. Header
           // overrides and credential replacement make ownership unprovable: skip those writes.
@@ -4149,9 +4404,9 @@ async function handleResponsesInner(
   );
   let adapterProvider = resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire);
   const stripClaudeMainAuth = options.stripClaudeMainAuthForNoncanonicalForward === true
-    && adapterProvider.adapter === "openai-responses"
-    && adapterProvider.authMode === "forward"
-    && !isCanonicalOpenAiForwardProvider(adapterProvider);
+    && !isCanonicalOpenAiForwardProvider(adapterProvider)
+    && ((adapterProvider.adapter === "openai-responses" && adapterProvider.authMode === "forward")
+      || providerConsumesCallerAuthorization(adapterProvider));
   if (stripClaudeMainAuth) {
     releaseCodexAuthContextProbeLease(authCtx);
     authCtx = { kind: "main", accountId: null };
@@ -4239,9 +4494,18 @@ async function handleResponsesInner(
   const needsOpenAiSearch = shouldResolveOpenAiWebSearchSidecar(config, parsed, isPassthrough);
   if (needsOpenAiVision || needsOpenAiSearch) {
     try {
+      // Preserve explicit OpenAI helper auth across route changes without returning it to
+      // primary-provider headers or alternate-main retry. The resolver revalidates scope.
+      const sidecarHeaders = new Headers(req.headers);
+      sidecarHeaders.delete("authorization");
+      sidecarHeaders.delete("chatgpt-account-id");
+      if (options.openAiSidecarAuth) {
+        sidecarHeaders.set("authorization", options.openAiSidecarAuth.authorization);
+        sidecarHeaders.set("chatgpt-account-id", options.openAiSidecarAuth.chatgptAccountId);
+      }
       openAiSidecar = await resolveFirstUsableOpenAiSidecar(
         listOpenAiForwardSidecarCandidates(config),
-        req.headers,
+        sidecarHeaders,
         config,
         {
           admission: options.admission,
@@ -4298,6 +4562,17 @@ async function handleResponsesInner(
   }
 
   const recordTerminalOutcomes = options.recordTerminalOutcomes !== false;
+  let responseCompletionNotified = false;
+  let responseCompletionCancelled = false;
+  const cancelResponseCompletion = (): void => { responseCompletionCancelled = true; };
+  const notifyResponseComplete = (response: { status?: unknown; model?: unknown }): void => {
+    if (responseCompletionNotified || responseCompletionCancelled
+      || options.abortSignal?.aborted || req.signal.aborted
+      || response.status !== "completed"
+      || typeof response.model !== "string" || !response.model.trim()) return;
+    responseCompletionNotified = true;
+    options.onResponseComplete?.(response.model);
+  };
 
   const continuationStateForResponse = (
     emitted?: OcxProviderContinuationState,
@@ -4575,9 +4850,26 @@ async function handleResponsesInner(
     // check sees nothing undeclared, and the refused turn enters continuation state anyway. So the
     // rejection is sticky for the whole turn, set from every parsed payload on the inspection side.
     let inspectionSawUndeclaredTool = false;
+    let inspectedTerminal: ResponsesTerminalStatus | null = null;
+    let inspectedCompletionSeen = false;
+    let firstTerminalAllowsRecall = false;
     const passiveQuotaObserved = hasPassiveAccountQuota(route.providerName)
       && route.provider.authMode === "oauth";
     const noteInspectedPayload = (payload: unknown) => {
+      // First terminal stays authoritative even in metadata-only inspection, which
+      // intentionally continues parsing after a failed/incomplete terminal.
+      const terminal = terminalStatusFromParsed(payload);
+      if (inspectedTerminal === null && terminal !== null) {
+        inspectedTerminal = terminal;
+        // The client boundary accepts a terminal by event type, even without a
+        // response object. Such a terminal must permanently decline recall.
+        if (terminal === "completed" && payload && typeof payload === "object"
+          && "response" in payload && payload.response && typeof payload.response === "object"
+          && !Array.isArray(payload.response) && "model" in payload.response) {
+          firstTerminalAllowsRecall = typeof payload.response.model === "string"
+            && payload.response.model.trim().length > 0;
+        }
+      }
       // Meta reports subscription usage ONLY as an in-stream event; there is no endpoint
       // to poll (003 §E probed 17 paths, all 404). Observed here rather than behind a
       // dedicated inspector handler because onParsedPayload already reaches every
@@ -4599,8 +4891,7 @@ async function handleResponsesInner(
       // Gated on the same flag as the guard itself: with no readable catalog (or a forward-auth
       // provider) every name looks undeclared, and flipping this would stop recording continuation
       // state for exactly the passthrough traffic the guard deliberately stands down for.
-      if (!undeclaredToolGuardActive || inspectionSawUndeclaredTool) return;
-      if (undeclaredToolCallName(
+      if (undeclaredToolGuardActive && !inspectionSawUndeclaredTool && undeclaredToolCallName(
         restoreAuthorizedBareNamespaceToolCalls(payload),
         declaredWireToolNames,
         declaredNamelessClientCallTypes,
@@ -4608,33 +4899,61 @@ async function handleResponsesInner(
       ) !== undefined) {
         inspectionSawUndeclaredTool = true;
       }
-    };
-    const rememberPassthroughResponseChecked = rememberPassthroughResponse
-      ? (response: { id?: unknown; output?: unknown; status?: unknown }) => {
-        if (inspectionSawUndeclaredTool) return;
-        const restored = restoreRoutedCustomCalls(
-          restoreAuthorizedBareNamespaceToolCalls(restoreRoutedNamespaceCalls(response, routedNamespaceToolAliases).value),
-          routedCustomToolNames,
-          routedCustomToolRepairNames,
-          declaredWireToolNames,
-        ).value;
-        const restoredResponse = (functionRepairSchemas.size > 0
-          ? JSON.parse(normalizeFunctionCompletionJson(JSON.stringify(restored)))
-          : restored) as { id?: unknown; output?: unknown; status?: unknown };
-        if (
-          undeclaredToolGuardActive
-          && undeclaredToolCallNameInResponse(
-            restoredResponse,
-            declaredWireToolNames,
-            declaredNamelessClientCallTypes,
-            providerExecutedCallTypes,
-          ) !== undefined
-        ) {
-          return;
-        }
-        rememberPassthroughResponse(restoredResponse);
+      // The snapshot callback opts the inspector into output reconstruction. Compaction
+      // has no continuation cache, so use the parsed terminal here without adding retention.
+      if (!rememberPassthroughResponse && payload && typeof payload === "object"
+        && "type" in payload && payload.type === "response.completed"
+        && "response" in payload && payload.response && typeof payload.response === "object"
+        && !Array.isArray(payload.response)) {
+        rememberPassthroughResponseChecked(payload.response as Record<string, unknown>);
       }
-      : undefined;
+    };
+    const rememberPassthroughResponseChecked = (
+      response: { id?: unknown; output?: unknown; status?: unknown; model?: unknown },
+    ) => {
+      if (inspectionSawUndeclaredTool) return;
+      const restored = restoreRoutedCustomCalls(
+        restoreAuthorizedBareNamespaceToolCalls(restoreRoutedNamespaceCalls(response, routedNamespaceToolAliases).value),
+        routedCustomToolNames,
+        routedCustomToolRepairNames,
+        declaredWireToolNames,
+      ).value;
+      const restoredResponse = (functionRepairSchemas.size > 0
+        ? JSON.parse(normalizeFunctionCompletionJson(JSON.stringify(restored)))
+        : restored) as { id?: unknown; output?: unknown; status?: unknown };
+      // Replay overlap compares the items the client echoes, including visible reasoning shape.
+      const replayResponse = parsed.options.hideThinkingSummary !== true
+        && routeUsesContentChannelReasoning(route.provider, route.modelId)
+        ? rewriteReasoningSummaryInJson(restoredResponse) as typeof restoredResponse
+        : restoredResponse;
+      if (
+        undeclaredToolGuardActive
+        && undeclaredToolCallNameInResponse(
+          restoredResponse,
+          declaredWireToolNames,
+          declaredNamelessClientCallTypes,
+          providerExecutedCallTypes,
+        ) !== undefined
+      ) {
+        return;
+      }
+      rememberPassthroughResponse?.(replayResponse);
+      const firstCompletion = !inspectedCompletionSeen;
+      inspectedCompletionSeen = true;
+      if (firstCompletion && (inspectedTerminal === null || firstTerminalAllowsRecall)) {
+        // A model-less first completion permanently declines recall; later terminal
+        // frames are hidden by the client boundary and cannot supply its identity.
+        // Native inspection sees the pre-rewrite model. Only an actual terminal
+        // model can seed recall; an absent model never falls back to the pick.
+        if (typeof response.model === "string" && response.model.trim()) {
+          notifyResponseComplete({
+            status: response.status,
+            model: parsed._responseModelId !== undefined && parsed._responseModelId !== parsed.modelId
+              ? parsed._responseModelId : response.model,
+          });
+        }
+      }
+    };
     recordAdapterReasoning(logCtx, request);
     recordAdapterTier(logCtx, request);
     const actualHostKey = upstreamHostHealthKey(
@@ -4799,7 +5118,7 @@ async function handleResponsesInner(
               dispatchOverride: oauthDispatch(request),
               providerName: route.providerName,
               modelId: route.modelId,
-              onCodexWsQuota: codexWsQuotaObserver(authCtx, route.provider),
+              onCodexWsQuota: codexWsQuotaObserver(authCtx, route.provider, route.modelId),
               beforeDispatch: isCanonicalOpenAiForwardProvider(route.provider)
                 ? createCodexReserveDispatchGuard(authCtx, options.codexAuthPolicy ?? config, route.modelId, options.admission, options.visionDescribeTerminal === true) : undefined,
             }),
@@ -4877,7 +5196,7 @@ async function handleResponsesInner(
               dispatchOverride: oauthDispatch(request),
                 providerName: route.providerName,
                 modelId: route.modelId,
-                onCodexWsQuota: codexWsQuotaObserver(authCtx, route.provider),
+                onCodexWsQuota: codexWsQuotaObserver(authCtx, route.provider, route.modelId),
                 beforeDispatch: isCanonicalOpenAiForwardProvider(route.provider)
                   ? createCodexReserveDispatchGuard(authCtx, options.codexAuthPolicy ?? config, route.modelId, options.admission, options.visionDescribeTerminal === true) : undefined,
               }),
@@ -4983,7 +5302,7 @@ async function handleResponsesInner(
               dispatchOverride: oauthDispatch(request),
               providerName: route.providerName,
               modelId: route.modelId,
-              onCodexWsQuota: codexWsQuotaObserver(authCtx, route.provider),
+              onCodexWsQuota: codexWsQuotaObserver(authCtx, route.provider, route.modelId),
               beforeDispatch: isCanonicalOpenAiForwardProvider(route.provider)
                 ? createCodexReserveDispatchGuard(authCtx, options.codexAuthPolicy ?? config, route.modelId, options.admission, options.visionDescribeTerminal === true) : undefined,
             }),
@@ -5103,7 +5422,7 @@ async function handleResponsesInner(
               dispatchOverride: oauthDispatch(request),
                 providerName: route.providerName,
                 modelId: route.modelId,
-                onCodexWsQuota: codexWsQuotaObserver(authCtx, route.provider),
+                onCodexWsQuota: codexWsQuotaObserver(authCtx, route.provider, route.modelId),
                 beforeDispatch: isCanonicalOpenAiForwardProvider(route.provider)
                   ? createCodexReserveDispatchGuard(authCtx, options.codexAuthPolicy ?? config, route.modelId, options.admission, options.visionDescribeTerminal === true) : undefined,
               }),
@@ -5203,7 +5522,7 @@ async function handleResponsesInner(
               dispatchOverride: oauthDispatch(request),
                 providerName: route.providerName,
                 modelId: route.modelId,
-                onCodexWsQuota: codexWsQuotaObserver(authCtx, route.provider),
+                onCodexWsQuota: codexWsQuotaObserver(authCtx, route.provider, route.modelId),
                 beforeDispatch: isCanonicalOpenAiForwardProvider(route.provider)
                   ? createCodexReserveDispatchGuard(authCtx, options.codexAuthPolicy ?? config, route.modelId, options.admission, options.visionDescribeTerminal === true) : undefined,
               }),
@@ -5271,7 +5590,7 @@ async function handleResponsesInner(
         // justify because this flag already produced the identical result.
         const storedReplaySpent = codex401ReplayKind === "stored";
         const retry = await retryCodexPoolOnAlternateAccount({
-          req,
+          callerAuthHeaders,
           config,
           route,
           parsed,
@@ -5407,7 +5726,8 @@ async function handleResponsesInner(
       const { applyAccountQuotaFromUpstreamHeaders } = await import("../../codex/auth-api");
       if (!isCodexWsQuotaObservedResponse(upstreamResponse)) {
         applyAccountQuotaFromUpstreamHeaders(authCtx.accountId, upstreamResponse.headers,
-          authCtx.writerGeneration, authCtx.kind === "main-pool" ? authCtx.mainQuotaWriter : undefined);
+          authCtx.writerGeneration, authCtx.kind === "main-pool" ? authCtx.mainQuotaWriter : undefined,
+          { modelId: route.modelId });
       }
       if (terminalBodyWillRecord) {
         options.setTerminalOutcomeRecorder?.((status, httpStatusOverride) => {
@@ -5448,7 +5768,8 @@ async function handleResponsesInner(
 
     // Non-2xx passthrough failures must never reach Codex as an empty body —
     // Codex renders that as the opaque "Unknown error" (#452). Combo attempts
-    // keep their typed failure envelope. Non-empty bodies are relayed verbatim
+    // keep their typed failure envelope. Except for the classified 413 below,
+    // non-empty bodies are relayed verbatim
     // (headers included) so pool-retry Activation B/D and client diagnostics stay intact.
     // Manual-redirect policy (#914): a 3xx is relayed as-is (Location preserved
     // through sanitizePassthroughHeaders) so a redirect to a dead host can never
@@ -5476,11 +5797,10 @@ async function handleResponsesInner(
       // The bounded reader owns the original body, deadline, abort settlement, and lock.
       // Unsafe partial data falls back to #452's non-empty status-only JSON.
       const errorText = await readDisplaySafeErrorText(upstreamResponse, upstream.signal, "");
-      if (upstreamResponse.status === 413 && clientRequestedStream) {
-        return streamingContextOverflowResponse(
-          parsed._responseModelId ?? parsed.modelId,
-          translatorBudget,
-        );
+      if (upstreamResponse.status === 413) {
+        return clientRequestedStream
+          ? streamingContextOverflowResponse(parsed._responseModelId ?? parsed.modelId, translatorBudget)
+          : jsonContextOverflowResponse();
       }
       return formatPassthroughUpstreamError(upstreamResponse.status, errorText, {
         statusText: upstreamResponse.statusText,
@@ -5509,15 +5829,60 @@ async function handleResponsesInner(
         route.provider,
         route.modelId,
       );
+      // #3761: opt-in hosted-web-search bridge. Codex always declares the hosted web_search tool,
+      // and this branch relays that declaration on the assumption the destination executes it.
+      // A KEY-auth gateway that does not (Ollama Cloud GLM) answers with a function_call named
+      // web_search that nothing runs, and the undeclared-tool guard below ends the turn. When the
+      // provider opts in, the bridge intercepts that one call, runs the search, continues the
+      // conversation upstream, and hands back ordinary Responses SSE — so every rewrite below,
+      // including the guard itself, still inspects the client-facing stream. Default OFF: without
+      // the opt-in this is one planner call and the relay is byte-identical to before.
+      const webSearchBridgePlan = planPassthroughWebSearchBridge(parsed, route.provider, {
+        isPassthrough: true,
+        stream: parsed.stream === true,
+      });
+      // The bridge wraps the RAW upstream body, so terminal repair below still owns the single
+      // client-facing terminal — the bridge drops the terminal of every intercepted leg.
+      const upstreamSseBody = webSearchBridgePlan
+        ? createPassthroughWebSearchBridgeStream({
+          plan: webSearchBridgePlan,
+          firstLeg: upstreamResponse.body,
+          requestBody: request.body,
+          // Continuation legs replay the same built request with the executed search appended.
+          // The first leg already passed the recovery ladder, the outbound size ceiling, and the
+          // host circuit; a KEY-auth destination has no OAuth refresh to replay on a later leg.
+          send: (continuationBody: string) => fetchWithHeaderTimeout(
+            request.url,
+            { method: request.method, headers: request.headers, body: continuationBody },
+            upstream.signal,
+            connectMs,
+            true,
+            providerFetch(route.provider, options.codexWsRuntimeIdentity, {
+              dispatchOverride: oauthDispatch(request),
+              providerName: route.providerName,
+              modelId: route.modelId,
+            }),
+            false,
+          ),
+          execute: createOllamaBridgeExecutor(webSearchBridgePlan, route.provider.apiKey ?? ""),
+          // Appending a search result can push the continuation past the ceiling the first leg
+          // was admitted under, so the same limit is re-applied before every later send.
+          checkOutboundBody: (continuationBody: string) => {
+            const result = checkOutboundBodySize(continuationBody, config.maxUpstreamBodyBytes);
+            return result.admitted ? undefined : describeOutboundBodyRefusal(result);
+          },
+          signal: upstream.signal,
+        })
+        : upstreamResponse.body;
       const passthroughSseBody = terminalRepairPolicy
         ? relayResponsesSseWithTerminalRepair(
-          upstreamResponse.body,
+          upstreamSseBody,
           upstream,
           terminalRepairPolicy,
           translatorBudget,
           options.responsesTerminalRepairScheduler,
         )
-        : upstreamResponse.body;
+        : upstreamSseBody;
       const repairConfig = route.provider.responsesItemIdRepair;
       // Grok Build renders deltas live but reconstructs its durable assistant
       // turn from the completed response snapshot. Native Responses streams
@@ -5642,7 +6007,7 @@ async function handleResponsesInner(
         const inspector = createSseInspector({
           onTerminal: reportNativeTerminal,
           logCtx,
-          onCompletedResponse: rememberPassthroughResponseChecked,
+          onCompletedResponse: rememberPassthroughResponse ? rememberPassthroughResponseChecked : undefined,
           onParsedPayload: noteInspectedPayload,
           onFirstOutput: options.onFirstOutput,
           pinCompletedResponseIdToFirstSeen: githubCopilotRepairEnabled,
@@ -5672,7 +6037,10 @@ async function handleResponsesInner(
               reportNativeTerminal("failed", 502);
             }
           },
-          onClientCancel: () => options.onNativePassthroughCancel?.(),
+          onClientCancel: () => {
+            responseCompletionCancelled = true;
+            options.onNativePassthroughCancel?.();
+          },
           onDone: () => unregisterTurn(turnAc),
         }, {
           clientGoneSignal: options.abortSignal,
@@ -5734,8 +6102,11 @@ async function handleResponsesInner(
           turnAc.signal,
           () => unregisterTurn(turnAc),
           logCtx,
-          () => options.onNativePassthroughCancel?.(),
-          rememberPassthroughResponseChecked,
+          () => {
+            responseCompletionCancelled = true;
+            options.onNativePassthroughCancel?.();
+          },
+          rememberPassthroughResponse ? rememberPassthroughResponseChecked : undefined,
           options.onFirstOutput,
           inspectionConsumerOptions,
         );
@@ -5745,7 +6116,7 @@ async function handleResponsesInner(
           logCtx,
           turnAc.signal,
           () => unregisterTurn(turnAc),
-          rememberPassthroughResponseChecked,
+          rememberPassthroughResponse ? rememberPassthroughResponseChecked : undefined,
           options.onFirstOutput,
           inspectionConsumerOptions,
         );
@@ -5760,7 +6131,10 @@ async function handleResponsesInner(
       const clientBody = relaySseWithFailedTail(
         rewrittenBody,
         upstream,
-        reason => clientGone.abort(reason),
+        reason => {
+          responseCompletionCancelled = true;
+          clientGone.abort(reason);
+        },
         { upstreamError: logCtx.upstreamError },
       );
       return markNativePassthroughSseResponse(new Response(clientBody, {
@@ -5840,13 +6214,11 @@ async function handleResponsesInner(
         }
       }
       commitReasoningReplayServingRoute();
-      if (rememberPassthroughResponseChecked) {
-        try {
-          rememberPassthroughResponseChecked(
-            JSON.parse(text) as { id?: unknown; output?: unknown; status?: unknown },
-          );
-        } catch { /* non-JSON despite content-type; recording is best-effort */ }
-      }
+      try {
+        rememberPassthroughResponseChecked(
+          JSON.parse(text) as { id?: unknown; output?: unknown; status?: unknown; model?: unknown },
+        );
+      } catch { /* non-JSON despite content-type; recording is best-effort */ }
       // #875: the transport-neutral reliability policy forced a bounded JSON
       // upstream for a client that asked for SSE. Reframe the completed JSON
       // as the canonical terminal SSE sequence (created → output_item.done →
@@ -6180,10 +6552,12 @@ async function handleResponsesInner(
           continuationStateForResponse(providerState),
           responseStateOptions(adapterNeedsForcedContinuation(adapter.name)),
         );
+        notifyResponseComplete(response);
       },
     });
     if (imgResponse.body) {
       const imgTurnAc = new AbortController();
+      imgTurnAc.signal.addEventListener("abort", cancelResponseCompletion, { once: true });
       return new Response(trackStreamLifetime(imgResponse.body, imgTurnAc, undefined, options.turnAdmissionLease), {
         status: imgResponse.status,
         headers: imgResponse.headers,
@@ -6254,12 +6628,16 @@ async function handleResponsesInner(
       streamRoutedModelOutput: wsPlan.streamRoutedModelOutput,
       on429: rotateSidecarProviderOn429,
       retryOn429Policy: rateLimitRetryPolicyFor(route.provider),
-      onCompletedResponse: commitReasoningReplayServingRoute,
+      onCompletedResponse: response => {
+        commitReasoningReplayServingRoute();
+        notifyResponseComplete(response);
+      },
     });
     // Register the sidecar stream as an active turn so drainAndShutdown waits for (or aborts)
     // in-flight web-search turns instead of skipping them during graceful shutdown.
     if (wsResponse.body) {
       const wsTurnAc = new AbortController();
+      wsTurnAc.signal.addEventListener("abort", cancelResponseCompletion, { once: true });
       return new Response(trackStreamLifetime(wsResponse.body, wsTurnAc, undefined, options.turnAdmissionLease), {
         status: wsResponse.status,
         headers: wsResponse.headers,
@@ -6483,6 +6861,7 @@ async function handleResponsesInner(
       const sseStream = bridgeToResponsesSSE(
         guardedSource, parsed._responseModelId ?? parsed.modelId, toolNsMap, freeformToolNames, toolSearchToolNames,
         () => {
+          cancelResponseCompletion();
           runTurnAbort.abort();
           queue.close();
         }, 2_000,
@@ -6519,6 +6898,7 @@ async function handleResponsesInner(
                 responseStateOptions(adapterNeedsForcedContinuation(adapter.name)),
               );
             }
+            notifyResponseComplete(response);
           },
         },
       );
@@ -6595,6 +6975,7 @@ async function handleResponsesInner(
     if (adapterResponseReachedServingTerminal(events, json)) {
       commitReasoningReplayServingRoute();
     }
+    notifyResponseComplete(json);
     return new Response(JSON.stringify(json), { headers: { "Content-Type": "application/json" } });
   }
 
@@ -6642,10 +7023,11 @@ async function handleResponsesInner(
         toolBridgeMaps.toolNsMap,
         toolBridgeMaps.freeformToolNames,
         toolBridgeMaps.toolSearchToolNames,
-        undefined,
+        cancelResponseCompletion,
         2_000,
         {
           translatorBudget,
+          onCompletedResponse: notifyResponseComplete,
           ...(options.forceEmptyResponseId ? { responseId: "" } : {}),
           ...(options.onFirstOutput ? { onFirstOutput: options.onFirstOutput } : {}),
         },
@@ -6666,12 +7048,9 @@ async function handleResponsesInner(
         },
       );
     }
-    return new Response(
-      JSON.stringify(buildResponseJSON(terminalEvents, parsed._responseModelId ?? parsed.modelId, {
-        translatorBudget,
-      })),
-      { headers: { "Content-Type": "application/json" } },
-    );
+    const json = buildResponseJSON(terminalEvents, parsed._responseModelId ?? parsed.modelId, { translatorBudget });
+    notifyResponseComplete(json);
+    return new Response(JSON.stringify(json), { headers: { "Content-Type": "application/json" } });
   }
   // One request-scoped transient-retry budget owner, declared here so BOTH the initial send
   // and the later recovery refetches (429, key/account rotation, OAuth replay) share it. A
@@ -7198,11 +7577,10 @@ async function handleResponsesInner(
       } finally {
         cleanupUpstreamAbort();
       }
-      if (upstreamResponse.status === 413 && clientRequestedStream && !options.comboAttempt) {
-        return streamingContextOverflowResponse(
-          parsed._responseModelId ?? parsed.modelId,
-          translatorBudget,
-        );
+      if (upstreamResponse.status === 413) {
+        return clientRequestedStream
+          ? streamingContextOverflowResponse(parsed._responseModelId ?? parsed.modelId, translatorBudget)
+          : jsonContextOverflowResponse();
       }
       if (!isFixedCodexAccount(authCtx)) {
         recordSubagentQuotaFailureForThreadSpawn(
@@ -7222,7 +7600,7 @@ async function handleResponsesInner(
       const message = normalized.cyberPolicy
         ? normalized.message
           ?? (isCyberPolicyCode(normalized.code) ? CYBER_POLICY_FALLBACK_MESSAGE : normalized.safeText)
-        : enrichOpenCodeZenRateLimitMessage(
+        : enrichOpenCodeZenUpstreamMessage(
           `Provider error ${upstreamResponse.status}: ${normalized.safeText}`,
           {
             status: upstreamResponse.status,
@@ -7233,7 +7611,7 @@ async function handleResponsesInner(
             hasApiKey: Boolean(route.provider.apiKey?.trim()),
             upstreamRetryAfter,
             // This recovery path is the HTTP Responses wire; custom runTurn transports
-            // never reach enrichOpenCodeZenRateLimitMessage here.
+            // never reach enrichOpenCodeZenUpstreamMessage here.
             supportsHttpSameKeyRetry: true,
           },
         );
@@ -7653,7 +8031,7 @@ async function handleResponsesInner(
     const { toolNsMap, declaredToolNames, toolParameterSchemas, freeformToolNames, toolSearchToolNames } = toolBridgeMaps;
     const sseStream = bridgeToResponsesSSE(
       guardedEventStream, parsed._responseModelId ?? parsed.modelId, toolNsMap, freeformToolNames, toolSearchToolNames,
-      () => upstream.abort(), 2_000,
+      () => { cancelResponseCompletion(); upstream.abort(); }, 2_000,
       {
         translatorBudget,
         replayCacheScope: parsed._reasoningReplayScope,
@@ -7688,6 +8066,7 @@ async function handleResponsesInner(
               responseStateOptions(activeAdapter.name === "kiro"),
             );
           }
+          notifyResponseComplete(response);
         },
       },
     );
@@ -7767,6 +8146,7 @@ async function handleResponsesInner(
     if (adapterResponseReachedServingTerminal(events, json)) {
       commitReasoningReplayServingRoute();
     }
+    notifyResponseComplete(json);
     return new Response(JSON.stringify(json), { headers: { "Content-Type": "application/json" } });
   }
 

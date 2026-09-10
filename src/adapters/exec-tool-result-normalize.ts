@@ -158,6 +158,10 @@ export const CODE_MODE_HOST_FAILURE_GUIDANCE: ReadonlyArray<{ marker: string; gu
 /** Prefix of every recovery line this module appends; callers use it to recognise replayed annotations. */
 export const CODE_MODE_HOST_RECOVERY_PREFIX = "[recovery: ";
 
+// Only a leading failure envelope or a complete host diagnostic establishes error context.
+// Do not search for this prefix inside output: successful source reads can quote any of these.
+const CODE_MODE_HOST_ERROR_PREFIX = /^(?:Script failed(?:[ \t]*(?:\r?\n|$)|:)|Script error:|(?:Error|TypeError|SyntaxError):|tool `apply_patch` expects a string input\b|apply_patch verification failed:|Unsupported import in exec:)/i;
+
 /** Namespaces under which Cursor displays Codex's own Responses tools (see cursor/tool-naming.ts). */
 const CODEX_RESPONSES_DISPLAY_NAMESPACES: ReadonlySet<string> = new Set(["opencodex-responses", "mcp__opencodex-responses"]);
 /** Flattened spellings of the same code-mode exec when a client folds the namespace into the name. */
@@ -181,10 +185,10 @@ export function isCodexCodeModeExecResult(toolName?: string, toolNamespace?: str
 }
 
 /**
- * Append a one-line recovery hint when a code-mode exec result carries a known host failure string.
- * Returns undefined when the tool is not the code-mode exec, no marker matches, or a recovery line is
- * already present (a replayed annotated result must not grow a second one). Never touches error
- * status: the host already decided whether the call failed.
+ * Append a one-line recovery hint when a code-mode exec result starts with a host error context
+ * and carries a known diagnostic. Successful wrappers and unframed phrase quotations pass through.
+ * Returns undefined when the tool/context/marker does not match or a recovery line is already
+ * present (a replayed result must not grow a second one). Never touches error status.
  */
 export function annotateCodeModeHostFailure(
   text: string,
@@ -192,6 +196,7 @@ export function annotateCodeModeHostFailure(
 ): string | undefined {
   if (!isCodexCodeModeExecResult(options.toolName, options.toolNamespace)) return undefined;
   if (text.includes(CODE_MODE_HOST_RECOVERY_PREFIX)) return undefined;
+  if (!CODE_MODE_HOST_ERROR_PREFIX.test(text.trimStart())) return undefined;
   const lower = text.toLowerCase();
   const hit = CODE_MODE_HOST_FAILURE_GUIDANCE.find(({ marker }) => lower.includes(marker));
   return hit ? `${text}\n${CODE_MODE_HOST_RECOVERY_PREFIX}${hit.guidance}]` : undefined;

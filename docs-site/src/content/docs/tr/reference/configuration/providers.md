@@ -111,7 +111,7 @@ alanlı seçilmiş kimlikleri yalın kimliklere yeniden yazar.
 | `modelAutoCompactTokenLimits?` | `Record<string, number>` | Model başına pozitif güvenli tamsayı biçiminde yumuşak otomatik sıkıştırma bütçeleri. Değerler yalnızca bağlamın veya maksimum girdinin etkin %90 zarfını düşürebilir ve yetkili bir bağlam penceresi bilinmiyorsa yayımlanmaz. Canonical `openai` için anahtarlar, sağlayıcı veya hesap seçici öneki olmadan desteklenen tam yerel model kimlikleri olmalıdır. Sağlayıcı PATCH girdileri birleştirir; bir anahtarı `null` yapmak o anahtarı siler, alanın tamamını `null` yapmak haritayı temizler. Bu `null` silme işaretleri yalnızca PATCH içindir. |
 | `defaultMaxOutputTokens?` | `number` | İstemci `max_output_tokens` değerini atladığında sağlayıcı genelinde `openai-chat` geri dönüşü. |
 | `modelMaxOutputTokens?` | `Record<string, number>` | Pozitif model başına `openai-chat` geri dönüş bütçeleri; tam/kalıp eşleşmeleri sağlayıcı varsayılanını yener. |
-| `modelCosts?` | `Record<string, Cost4>` | Sağlayıcının tam yukarı akış model kimliğine göre anahtarlanan model başına görüntüleme fiyatları (1M token başına USD) — bir sağlayıcı tanımlayıcısı veya yönlendirilen `provider/model` etiketi değil, örn. `{ "deepseek-v4-flash": { "input": 0.14, "output": 0.28, "cacheRead": 0.0028, "cacheWrite": 0 } }`. Herhangi bir model kimliği geçerli bir anahtardır — özel sağlayıcılar `openai-chat` adaptörü aracılığıyla herhangi bir OpenAI uyumlu uç noktayı hedefleyebilir ve yerel veya dahili sağlayıcı kimlikleri yerleşik kataloglarda bulunmasalar bile çalışır. Kullanıcı tarafından yapılandırılan fiyatlar Günlükler `~$` ve Kullanım tahminlerinde yerleşik katalogları yener; geçmiş girdiler geçerli katmandan yeniden fiyatlandırılır, bu nedenle bir fiyatı düzenlemek geçmiş toplamları değiştirebilir. Geri dönüş sırası: kullanıcı `modelCosts` → jawcode kataloğu → beklenen fiyat katmanı → model düzeyinde satıcı geri dönüşü ve tamamen sıfır bir girdi bu dizideki bir sonraki kaynağa düşer. Her oran en fazla 1.000.000 (1M token başına USD) olan negatif olmayan sonlu bir sayı olmalıdır; aralık dışı satırlar yönetim sınırı tarafından reddedilir ve yükleme sırasında bırakılır. Yalnızca görüntüleme zamanı tahmini: katmanlar yönlendirmeyi, hesap seçimini, kotaları veya faturalandırmayı asla etkilemez. |
+| `modelCosts?` | `Record<string, Cost4>` | Sağlayıcının tam yukarı akış model kimliğine göre anahtarlanan model başına görüntüleme fiyatları (1M token başına USD) — bir sağlayıcı tanımlayıcısı veya yönlendirilen `provider/model` etiketi değil, örn. `{ "deepseek-v4-flash": { "input": 0.14, "output": 0.28, "cacheRead": 0.0028, "cacheWrite": 0 } }`. Herhangi bir model kimliği geçerli bir anahtardır — özel sağlayıcılar `openai-chat` adaptörü aracılığıyla herhangi bir OpenAI uyumlu uç noktayı hedefleyebilir ve yerel veya dahili sağlayıcı kimlikleri yerleşik kataloglarda bulunmasalar bile çalışır. Kullanıcı tarafından yapılandırılan fiyatlar Günlükler `~$` ve Kullanım tahminlerinde yerleşik katalogları yener; geçmiş girdiler geçerli katmandan yeniden fiyatlandırılır, bu nedenle bir fiyatı düzenlemek geçmiş toplamları değiştirebilir. Geri dönüş sırası: kullanıcı `modelCosts` → jawcode kataloğu → beklenen fiyat katmanı → model düzeyinde satıcı geri dönüşü ve kullanıcının açıkça sıfır olarak belirlediği oranlar bilinen sıfır maliyetli bir tahmin üretir; otomatik fiyatlandırmaya dönmek için model girdisini silin. Tamamen sıfır katalog fiyatları bir sonraki kaynağa geçmeye devam eder. Her oran en fazla 1.000.000 (1M token başına USD) olan negatif olmayan sonlu bir sayı olmalıdır; aralık dışı satırlar yönetim sınırı tarafından reddedilir ve yükleme sırasında bırakılır. Yalnızca görüntüleme zamanı tahmini: katmanlar yönlendirmeyi, hesap seçimini, kotaları veya faturalandırmayı asla etkilemez. |
 | `headers?` | `Record<string, string>` | Ek yukarı akış başlıkları. Yetkilendirme, çerezler, API anahtarı başlıkları, gömülü yeni satırlar ve geçersiz adlar reddedilir. |
 | `openRouterRouting?` | `OpenRouterProviderRouting` | Varsayılan OpenRouter `order`, `only` ve `allowFallbacks` tercihleri; yalnızca `openai-chat` ile kurallı OpenRouter için geçerlidir. |
 | `modelOpenRouterRouting?` | `Record<string, OpenRouterProviderRouting>` | Sağlayıcı genelindeki OpenRouter tercihinin yerini alan tam model kimliği geçersiz kılmaları. |
@@ -517,6 +517,23 @@ bildirir; senkronize edilen katalog `xhigh`'ı ayrı tutarken `max` bildirir.
   }
 }
 ```
+
+## Model görünen adı düzenleyicisi
+
+Kontrol panelindeki **Models**, keşfedilen modeller için okunabilir adları kalıcı olarak kaydetmenizi sağlar. Sağlayıcıyı genişletin, keşfedilen
+bir modeli bulun ve **Name** seçeneğini seçin. Okunabilir bir etiket kaydederken iletişim kutusu
+tam `provider/model` seçicisini görünür tutar. Sağlayıcı meta verilerine veya varsayılan seçici
+gösterimine dönmek için **Reset name** seçeneğini seçin. **Name** yalnızca görünümü değiştirir;
+ayrı takma ad kalemi kısa yönlendirme takma adını değiştirir ve bir görünen ad düzenleyicisi
+değildir. Yerel OpenAI ve özel model satırları mevcut kontrollerini korur.
+
+Değişiklik kaydedildiği halde yenileme başarısız olursa iletişim kutusu kaydedilen geçersiz kılma
+değerini yansıtır ve **Retry** kullanılabilir kalır. Sunucu katalog yakınsamasının başarısız
+olduğunu bildirdiyse Retry bu işlemi tekrarlar; yalnızca liste isteği başarısız olduysa listeyi
+yeniden yükler. Sıfırlama sonrası kurtarma, sıfırlama işlemini korur ve eski adı geri getirmez.
+İsteklerin, yazma işlemini ve ardından gelen liste yenilemesini kapsayan 60 saniyelik bir süresi
+vardır. Zaman aşımı yazma işlemini geri almaz: başka bir değişiklik yapmadan önce **Retry** ile
+geçerli adı kontrol edin.
 
 ## Tam örnek
 

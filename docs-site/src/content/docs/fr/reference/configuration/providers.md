@@ -104,7 +104,7 @@ sauvegarde dont le contenu diffère, puis réécrit en identifiants sans préfix
 | `modelAutoCompactTokenLimits?` | `Record<string, number>` | Budgets souples de compactage automatique par modèle, sous forme d'entiers sûrs positifs. Ils peuvent uniquement abaisser l'enveloppe effective de 90 % du contexte ou de l'entrée maximale et sont omis lorsqu'aucune fenêtre de contexte faisant autorité n'est connue. Pour le fournisseur canonique `openai`, les clés doivent être les identifiants exacts de modèles natifs pris en charge, sans préfixe de fournisseur ni de sélecteur de compte. PATCH fusionne les entrées ; `null` supprime une clé, tandis que `null` pour le champ entier efface la table. Ces marqueurs `null` sont réservés à PATCH. |
 | `defaultMaxOutputTokens?` | `number` | Solution de secours `openai-chat` à l’échelle du fournisseur lorsque le client omet `max_output_tokens`. |
 | `modelMaxOutputTokens?` | `Record<string, number>` | Budgets de repli `openai-chat` positifs par modèle ; les correspondances exactes ou par motif priment sur la valeur par défaut du fournisseur. |
-| `modelCosts?` | `Record<string, Cost4>` | Prix affichés par modèle (USD par 1M de jetons), indexés par l'identifiant exact du modèle en amont de ce fournisseur — et non par un identifiant de fournisseur ni par une étiquette routée `provider/model`, par exemple `{ "deepseek-v4-flash": { "input": 0.14, "output": 0.28, "cacheRead": 0.0028, "cacheWrite": 0 } }`. Tout identifiant de modèle constitue une clé valide : les fournisseurs personnalisés peuvent cibler n'importe quel point de terminaison compatible avec OpenAI au moyen de l'adaptateur `openai-chat`, et les identifiants de fournisseur locaux ou internes fonctionnent même s'ils sont absents des catalogues intégrés. Les prix configurés par l'utilisateur priment sur les catalogues intégrés dans les estimations des pages Journaux (`~$`) et Utilisation. Les entrées historiques sont recalculées à partir de la surcharge actuelle ; modifier un prix peut donc changer les totaux antérieurs. L'ordre de repli est le suivant : `modelCosts` défini par l'utilisateur → catalogue jawcode → surcharge des prix attendus → repli propre au fournisseur au niveau du modèle. Une entrée entièrement nulle passe à la source suivante. Chaque tarif doit être un nombre fini positif ou nul, inférieur ou égal à 1 000 000 (USD par 1M de jetons) ; les lignes hors plage sont rejetées par l'interface de gestion et ignorées au chargement. Ces valeurs servent uniquement à l'estimation lors de l'affichage : les surcharges n'affectent jamais le routage, la sélection des comptes, les quotas ni la facturation. |
+| `modelCosts?` | `Record<string, Cost4>` | Prix affichés par modèle (USD par 1M de jetons), indexés par l'identifiant exact du modèle en amont de ce fournisseur — et non par un identifiant de fournisseur ni par une étiquette routée `provider/model`, par exemple `{ "deepseek-v4-flash": { "input": 0.14, "output": 0.28, "cacheRead": 0.0028, "cacheWrite": 0 } }`. Tout identifiant de modèle constitue une clé valide : les fournisseurs personnalisés peuvent cibler n'importe quel point de terminaison compatible avec OpenAI au moyen de l'adaptateur `openai-chat`, et les identifiants de fournisseur locaux ou internes fonctionnent même s'ils sont absents des catalogues intégrés. Les prix configurés par l'utilisateur priment sur les catalogues intégrés dans les estimations des pages Journaux (`~$`) et Utilisation. Les entrées historiques sont recalculées à partir de la surcharge actuelle ; modifier un prix peut donc changer les totaux antérieurs. L'ordre de repli est le suivant : `modelCosts` défini par l'utilisateur → catalogue jawcode → surcharge des prix attendus → repli propre au fournisseur au niveau du modèle. Une surcharge utilisateur explicitement définie à zéro produit une estimation nulle connue ; supprimez cette entrée pour rétablir la tarification automatique. Les prix de catalogue entièrement nuls restent soumis au repli. Chaque tarif doit être un nombre fini positif ou nul, inférieur ou égal à 1 000 000 (USD par 1M de jetons) ; les lignes hors plage sont rejetées par l'interface de gestion et ignorées au chargement. Ces valeurs servent uniquement à l'estimation lors de l'affichage : les surcharges n'affectent jamais le routage, la sélection des comptes, les quotas ni la facturation. |
 | `headers?` | `Record<string, string>` | En-têtes supplémentaires en amont. L'autorisation, les cookies, les en-têtes de clé API, les nouvelles lignes intégrées et les noms invalides sont rejetés. |
 | `openRouterRouting?` | `OpenRouterProviderRouting` | Préférences OpenRouter `order`, `only` et `allowFallbacks` par défaut ; valable uniquement pour les OpenRouter canoniques avec `openai-chat`. |
 | `modelOpenRouterRouting?` | `Record<string, OpenRouterProviderRouting>` | Remplacements exacts de l'ID de modèle qui remplacent la préférence OpenRouter à l'échelle du fournisseur. |
@@ -472,6 +472,24 @@ avec un contexte de `922000` et une entrée maximale de `922000` ; OpenRouter i
   }
 }
 ```
+
+## Éditeur de noms d'affichage des modèles
+
+Dans le tableau de bord, **Models** permet d'enregistrer durablement des noms lisibles pour les modèles découverts. Développez le fournisseur,
+repérez un modèle découvert et choisissez **Name**. La boîte de dialogue garde le sélecteur exact
+`provider/model` visible pendant que vous enregistrez un libellé lisible. Choisissez **Reset name**
+pour revenir aux métadonnées du fournisseur ou au sélecteur utilisé par défaut. **Name** ne change
+que l'affichage ; le crayon distinct consacré à l'alias modifie l'alias court de routage et n'est
+pas un éditeur de nom d'affichage. Les lignes OpenAI natives et celles des modèles personnalisés
+conservent leurs commandes existantes.
+
+Si la modification est enregistrée mais que l'actualisation échoue, la boîte de dialogue reflète
+la valeur enregistrée et garde **Retry** disponible. Retry relance la convergence du catalogue
+si le serveur a signalé son échec, ou recharge la liste si seule la requête de liste a échoué.
+La reprise d'une réinitialisation conserve cette opération ; elle ne rétablit pas l'ancien nom.
+Les requêtes ont un délai maximal de 60 secondes couvrant l'écriture et l'actualisation de la liste
+qui suit. Un dépassement de délai n'annule pas une écriture : utilisez **Retry** pour vérifier
+le nom actuel avant d'effectuer une autre modification.
 
 ## Exemple complet
 
