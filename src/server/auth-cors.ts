@@ -578,22 +578,14 @@ function nativeContextOverlayError(raw: Record<string, unknown>): string | null 
  * string, or null when the provider may be persisted. Caller-controlled names/fields are
  * redacted and JSON-escaped so secrets never reach the response.
  */
-function requestTransformsConfigError(value: unknown, field = "requestTransforms"): string | null {
-  if (value === undefined) return null;
-  if (!Array.isArray(value)) return `${field} must be an array`;
-  for (const [index, entry] of value.entries()) {
-    if (typeof entry !== "string" || !entry.trim()) {
-      return `${field}.${index} must be a nonblank string`;
-    }
-  }
-  return null;
-}
-
 export function providerManagementConfigError(name: unknown, provider: unknown): string | null {
   if (typeof name !== "string" || !provider || typeof provider !== "object" || Array.isArray(provider)) {
     return "provider must be a plain object";
   }
   const raw = provider as Record<string, unknown>;
+  if (Object.hasOwn(raw, "requestTransforms")) {
+    return "requestTransforms may only be configured in the local config file";
+  }
   const pinsError = providerReasoningPinsConfigError(raw);
   if (pinsError) return pinsError;
   for (const field of FORBIDDEN_PROVIDER_RUNTIME_FIELDS) {
@@ -634,7 +626,6 @@ export function providerManagementConfigError(name: unknown, provider: unknown):
     // validation and then rejected by the seed comparison, so canonical OpenAI could never
     // set OR clear it — the value was admitted and then refused in the same request.
     delete canonicalCandidate.annotateEmptyToolOutputs;
-    delete canonicalCandidate.requestTransforms;
     const canonical = seed && sameCanonicalProviderSeed(canonicalCandidate, seed);
     if (!canonical) {
       return `provider ${name} must equal the canonical built-in provider seed`;
@@ -721,8 +712,6 @@ export function providerManagementConfigError(name: unknown, provider: unknown):
   if (structuredOutputOptOutError) return `provider ${name} ${structuredOutputOptOutError}`;
   const retainModelsError = nonBlankStringArrayConfigError(raw.retainModels, "retainModels");
   if (retainModelsError) return `provider ${name} ${retainModelsError}`;
-  const requestTransformsError = requestTransformsConfigError(raw.requestTransforms);
-  if (requestTransformsError) return `provider ${name} ${requestTransformsError}`;
   const toolReasoningOptOutError = nonBlankStringArrayConfigError(
     raw.omitReasoningEffortWithToolsModels,
     "omitReasoningEffortWithToolsModels",
@@ -781,7 +770,7 @@ export function copyIfDefined<K extends keyof OcxProviderConfig>(
  * admission. `satisfies Record<keyof OcxProviderConfig, ...>` makes a newly added
  * provider field fail typecheck until it is deliberately classified.
  *
- * `editor` fields are user-authored, `redacted` fields may contain credentials,
+ * `editor` fields are user-authored, `redacted` fields contain credentials or local-only authority,
  * and `runtime` fields are observations/limits that must never become editor write
  * authority. MCP and desktop executor blocks are redacted as a whole because both
  * contain arbitrary environment variables and/or headers.
@@ -875,7 +864,8 @@ const PROVIDER_CONFIG_FIELD_POLICY = {
   noTopPModels: "editor",
   noPenaltyModels: "editor",
   noStructuredOutputModels: "editor",
-  requestTransforms: "editor",
+  // Executable local module paths are neither public DTO data nor editor authority.
+  requestTransforms: "redacted",
   omitReasoningEffortWithToolsModels: "editor",
   parallelToolCalls: "editor",
   pinParallelToolCallsFalse: "editor",

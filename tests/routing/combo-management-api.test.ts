@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -150,7 +150,6 @@ async function responseJson(response: Response | null): Promise<Record<string, u
 }
 
 afterEach(() => {
-  mock.restore();
   clearComboSelectionState();
   clearComboTargetCooldowns();
 });
@@ -832,15 +831,12 @@ describe("combo management API", () => {
   });
 
   test("GET subagent models exposes a combo alias as an available round-trip value", async () => {
-    spyOn(await import("../../src/codex/app-server-processes"), "collectCodexAppServerCatalogState")
-      .mockReturnValue({ state: "not_running", processes: [], catalogMtimeMs: null });
     const config = baseConfig({
       subagentModels: ["deepseek-v4-flash"],
       combos: {
         free: { ...VALID_COMBO, alias: "deepseek-v4-flash" },
       },
     });
-    for (const provider of Object.values(config.providers)) provider.liveModels = false;
     config.providers.a!.modelContextWindows = { m1: 128_000 };
 
     const response = await comboApi(config, "GET", "/api/subagent-models");

@@ -1,19 +1,23 @@
 import type { OcxConfig, OcxParsedRequest, OcxProviderConfig } from "../types";
 
+export type DeepReadonly<T> = T extends object
+  ? { readonly [K in keyof T]: DeepReadonly<T[K]> }
+  : T;
+
 export interface RequestTransformContext {
   /** The settled provider name (e.g. "anthropic", "google-antigravity", "openai"). */
-  providerName: string;
+  readonly providerName: string;
   /** The settled model identifier. */
-  modelId: string;
+  readonly modelId: string;
   /** Effective provider configuration for this route. */
-  providerConfig: OcxProviderConfig;
+  readonly providerConfig: DeepReadonly<OcxProviderConfig>;
   /** Global OpenCodeX configuration. */
-  config: OcxConfig;
+  readonly config: DeepReadonly<OcxConfig>;
   /**
    * Whether the target model accepts image input (based on OpenCodeX's vision catalog & metadata).
    * Allows transforms like pxpipe to selectively convert long text blocks into images only for vision-capable models.
    */
-  acceptsImageInput: boolean;
+  readonly acceptsImageInput: boolean;
 }
 
 export type RequestTransformFn = (
@@ -25,4 +29,3 @@ export interface RequestTransformModule {
   default?: RequestTransformFn;
   transform?: RequestTransformFn;
 }
-

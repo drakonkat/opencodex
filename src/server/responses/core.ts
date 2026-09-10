@@ -3864,6 +3864,8 @@ async function handleResponsesInner(
     providerConfig: route.provider,
     config,
   });
+  // Replacement transforms change object identity; termination tracking is WeakMap-backed.
+  bindTurnTerminationScope(parsed, resolvedConversationId);
   const toolBridgeMaps = buildToolBridgeMaps(parsed, translatorBudget);
   // Attribute local auth/cooldown failures to the public selector too; exact auth may fail before
   // the normal post-resolution provider label is assigned.

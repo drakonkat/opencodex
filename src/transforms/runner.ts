@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import type { OcxConfig, OcxParsedRequest, OcxProviderConfig } from "../types";
 import { expandUserPath, getConfigDir } from "../config/paths";
 import { isVisionEligibleModel } from "../vision/eligibility";
@@ -18,10 +19,34 @@ function isValidParsedRequest(val: unknown): val is OcxParsedRequest {
   const candidate = val as Record<string, unknown>;
   return (
     typeof candidate.modelId === "string" &&
+    typeof candidate.stream === "boolean" &&
+    candidate.options !== null &&
+    typeof candidate.options === "object" &&
+    !Array.isArray(candidate.options) &&
     candidate.context !== null &&
     typeof candidate.context === "object" &&
+    !Array.isArray(candidate.context) &&
     Array.isArray((candidate.context as Record<string, unknown>).messages)
   );
+}
+
+/** Freeze an isolated configuration snapshot, including nested records and arrays. */
+function freezeSnapshot<T>(value: T): T {
+  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) freezeSnapshot(child);
+  }
+  return value;
+}
+
+/** Isolate hook-editable data without detaching shared proxy-owned replay holders. */
+function transformCandidate(parsed: OcxParsedRequest): OcxParsedRequest {
+  return {
+    ...parsed,
+    context: structuredClone(parsed.context),
+    options: structuredClone(parsed.options),
+    _rawBody: structuredClone(parsed._rawBody),
+  };
 }
 
 /**
@@ -69,8 +94,8 @@ export async function loadTransform(
         `[opencodex] request transform "${specifier}" did not export a default function or "transform" function.`,
       );
       return null;
-    } catch (err) {
-      console.warn(`[opencodex] failed to load request transform "${specifier}":`, err);
+    } catch {
+      console.warn(`[opencodex] failed to load request transform "${specifier}".`);
       return null;
     }
   })();
@@ -116,39 +141,41 @@ export async function applyRequestTransforms(args: {
     acceptsImageInput = false;
   }
 
-  const context: RequestTransformContext = {
+  const context: RequestTransformContext = freezeSnapshot(structuredClone({
     providerName,
     modelId,
     providerConfig,
     config,
     acceptsImageInput,
-  };
+  }));
 
   const configDir = getConfigDir();
-  const before = { ...parsed, context: structuredClone(parsed.context), options: structuredClone(parsed.options) };
   let currentParsed = parsed;
 
   for (const specifier of specifiers) {
     const fn = await loadTransform(specifier, configDir);
     if (!fn) continue;
     try {
-      const result = await fn(currentParsed, context);
-      if (result && typeof result === "object") {
-        if (isValidParsedRequest(result)) {
-          // A complete canonical replacement must not discard proxy-owned replay/auth state.
-          currentParsed = { ...currentParsed, ...result, previousResponseId: result.previousResponseId };
-        } else {
-          console.warn(
-            `[opencodex] request transform "${specifier}" returned an invalid request object; retaining current request.`,
-          );
-        }
+      const candidate = transformCandidate(currentParsed);
+      const result = await fn(candidate, context);
+      if (!isValidParsedRequest(result === undefined ? candidate : result)) {
+        console.warn(
+          `[opencodex] request transform "${specifier}" produced an invalid request; retaining last valid request.`,
+        );
+        continue;
       }
-    } catch (err) {
-      console.warn(`[opencodex] error running request transform "${specifier}":`, err);
+      // Omitted fields retain their current value; explicit undefined clears them.
+      // Proxy-owned holders remain shared rather than being structured-cloned.
+      const next = result === undefined ? candidate : { ...candidate, ...result };
+      // Synchronization is part of the transaction: a malformed nested edit may throw here.
+      syncTransformedResponsesBody(currentParsed, next);
+      if (isDeepStrictEqual(next._rawBody, currentParsed._rawBody)) next._rawBody = currentParsed._rawBody;
+      currentParsed = next;
+    } catch {
+      console.warn(`[opencodex] request transform "${specifier}" failed; retaining last valid request.`);
     }
   }
 
-  syncTransformedResponsesBody(before, currentParsed);
   currentParsed._requestTransformsApplied = true;
   return currentParsed;
 }
@@ -159,4 +186,3 @@ export async function applyRequestTransforms(args: {
 export function clearTransformCacheForTests(): void {
   transformCache.clear();
 }
-

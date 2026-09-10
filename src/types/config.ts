@@ -362,6 +362,7 @@ export interface OcxConfig {
   /**
    * Optional ordered list of pre-adapter request transform handler paths or package specifiers.
    * Handlers operate on OcxParsedRequest before the wire request is built by provider adapters.
+   * Trusted local config-file only; management API writes cannot configure executable handlers.
    */
   requestTransforms?: string[];
   /**

@@ -519,5 +519,6 @@ Client connection metadata stores a stable `apiKeyId` and a non-secret rotation 
 
 - Specifiers are resolved relative to `OPENCODEX_HOME` (`~/.opencodex`), current working directory, or treated as module specifiers.
 - Handlers receive `{ providerName, modelId, providerConfig, config, acceptsImageInput }` to facilitate optimizations like `pxpipe` (text-to-image for vision models) and `headroom` (context compression).
-- Execution is guarded per turn by `_requestTransformsApplied` so retries and replays do not execute transforms twice.
-
+- Transform lists are local-file configuration only; management API writes cannot add or change executable handlers.
+- Configuration context is a deeply read-only snapshot. Each handler's request changes are committed only after validation and native synchronization succeed; failures retain the last valid request.
+- Execution is guarded by `_requestTransformsApplied` for internal retries reusing a parsed request. New inbound requests, including history replays, run the pipeline again.

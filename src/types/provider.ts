@@ -238,7 +238,7 @@ export interface OcxProviderConfig {
   defaultAliases?: boolean;
   /**
    * Optional provider-scoped request transform handler paths or package specifiers,
-   * executed after global requestTransforms.
+   * executed after global requestTransforms. Local config-file only, not management-writable.
    */
   requestTransforms?: string[];
   adapter: string;

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { applyRequestTransforms, clearTransformCacheForTests, resolveTransformPath } from "../../src/transforms";
@@ -11,6 +11,8 @@ import type { OcxConfig, OcxParsedRequest, OcxProviderConfig } from "../../src/t
 import { parseRequest } from "../../src/responses/parser";
 import { handleResponses } from "../../src/server/responses";
 import { syncTransformedResponsesBody } from "../../src/transforms/responses-body";
+import type { RequestTransformContext } from "../../src/transforms/types";
+import { repoPath } from "../helpers/repo-root";
 
 describe("requestTransforms", () => {
   let testDir: string;
@@ -121,6 +123,128 @@ describe("requestTransforms", () => {
     ] });
     expect(result.context.messages).toHaveLength(2);
     expect(result._previousResponseInputExpanded).toBe(true);
+  });
+
+  test.each([false, true])("replacement preserves omitted previous response ID, explicit clear=%s", async clear => {
+    const path = join(testDir, "previous-id.ts");
+    writeFileSync(path, `export default parsed => ({
+      modelId: parsed.modelId, stream: parsed.stream, context: parsed.context, options: parsed.options,
+      ${clear ? "previousResponseId: undefined," : ""}
+    });`);
+    const providerConfig: OcxProviderConfig = { adapter: "openai-responses", baseUrl: "https://fixture.test/v1" };
+    const config: OcxConfig = { port: 0, defaultProvider: "fixture", requestTransforms: [path], providers: { fixture: providerConfig } };
+    const parsed = parseRequest({ model: "model", input: "next", previous_response_id: "resp_previous" });
+    const scope = { clientThreadId: "fixture-thread" };
+    parsed._reasoningReplayScope = scope;
+    const result = await applyRequestTransforms({ parsed, providerName: "fixture", modelId: "model", providerConfig, config });
+    expect(result.previousResponseId).toBe(clear ? undefined : "resp_previous");
+    expect((result._rawBody as Record<string, unknown>).previous_response_id).toBe(clear ? undefined : "resp_previous");
+    expect(result._reasoningReplayScope).toBe(scope);
+  });
+
+  test.each([
+    "parsed.context.messages = null;",
+    "parsed.options = null; return parsed;",
+    "return {};",
+    "throw new Error('private-request-fixture');",
+    "return Promise.reject(new Error('private-request-fixture'));",
+    // Passes the shallow shape check, but cannot be serialized as assistant content.
+    "parsed.context.messages.push({ role: 'assistant', content: null, timestamp: 0 });",
+  ])("failed hook rolls back edits and later hooks receive the last valid request: %s", async failure => {
+    const paths = ["first", "failed", "last"].map(name => join(testDir, `${name}.ts`));
+    writeFileSync(paths[0]!, `export default parsed => { parsed.context.messages.push({ role: "user", content: "first", timestamp: 0 }); };`);
+    writeFileSync(paths[1]!, `export default parsed => {
+      parsed.context.messages[0].content = "bad";
+      parsed.options.temperature = 99;
+      parsed._rawBody.vendor.keep = false;
+      ${failure}
+    };`);
+    writeFileSync(paths[2]!, `export default parsed => { parsed.context.messages.push({ role: "user", content: "last", timestamp: 0 }); };`);
+    const providerConfig: OcxProviderConfig = { adapter: "openai-responses", baseUrl: "https://fixture.test/v1" };
+    const config: OcxConfig = { port: 0, defaultProvider: "fixture", requestTransforms: paths, providers: { fixture: providerConfig } };
+    const parsed = parseRequest({ model: "model", input: "original", temperature: 0.5, vendor: { keep: true } });
+    const scope = { clientThreadId: "fixture-thread" };
+    parsed._reasoningReplayScope = scope;
+    const originalWarn = console.warn;
+    const warnings: unknown[][] = [];
+    console.warn = (...args: unknown[]) => { warnings.push(args); };
+    try {
+      const result = await applyRequestTransforms({ parsed, providerName: "fixture", modelId: "model", providerConfig, config });
+      expect(result.context.messages.map(message => message.content)).toEqual(["original", "first", "last"]);
+      expect(result.options.temperature).toBe(0.5);
+      expect(result._rawBody).toEqual({ model: "model", temperature: 0.5, vendor: { keep: true }, input: [
+        { role: "user", content: "original" }, { role: "user", content: "first" }, { role: "user", content: "last" },
+      ] });
+      expect(result._reasoningReplayScope).toBe(scope);
+      expect(result._requestTransformsApplied).toBe(true);
+      expect(warnings).toHaveLength(1);
+      expect(JSON.stringify(warnings)).not.toContain("private-request-fixture");
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  test("transform context is deeply readonly and cannot mutate live or later-hook configuration", async () => {
+    // Compile-time contract: callers cannot write through either configuration view.
+    const assertReadonly = (context: RequestTransformContext) => {
+      // @ts-expect-error nested global configuration is readonly
+      context.config.providers.fixture.baseUrl = "changed";
+      // @ts-expect-error nested effective provider configuration is readonly
+      context.providerConfig.headers.fixture = "changed";
+      // @ts-expect-error route metadata is readonly
+      context.providerName = "changed";
+    };
+    void assertReadonly;
+    const paths = ["mutate-config", "observe-config"].map(name => join(testDir, `${name}.ts`));
+    writeFileSync(paths[0]!, `export default (parsed, context) => {
+      for (const mutate of [
+        () => { context.config.providers.fixture.baseUrl = "changed"; },
+        () => { context.providerConfig.headers.fixture = "changed"; },
+        () => { context.config.requestTransforms.push("changed"); },
+        () => { context.providerName = "changed"; },
+      ]) { try { mutate(); } catch (error) { if (!(error instanceof TypeError)) throw error; } }
+    };`);
+    writeFileSync(paths[1]!, `export default (parsed, context) => {
+      parsed.context.messages.push({ role: "user", timestamp: 0, content: JSON.stringify({
+        url: context.config.providers.fixture.baseUrl, header: context.providerConfig.headers.fixture,
+        count: context.config.requestTransforms.length, provider: context.providerName,
+        frozen: [context, context.config, context.config.providers.fixture, context.providerConfig.headers, context.config.requestTransforms].every(Object.isFrozen)
+      }) });
+    };`);
+    const providerConfig: OcxProviderConfig = { adapter: "openai-responses", baseUrl: "https://fixture.test/v1", headers: { fixture: "original" } };
+    const config: OcxConfig = { port: 0, defaultProvider: "fixture", requestTransforms: paths, providers: { fixture: providerConfig } };
+    const before = structuredClone(config);
+    const result = await applyRequestTransforms({ parsed: parseRequest({ model: "model", input: "original" }), providerName: "fixture", modelId: "model", providerConfig, config });
+    expect(JSON.parse(result.context.messages[1]!.content as string)).toEqual({
+      url: "https://fixture.test/v1", header: "original", count: 2, provider: "fixture", frozen: true,
+    });
+    expect(config).toEqual(before);
+    expect(Object.isFrozen(config)).toBe(false);
+    expect(Object.isFrozen(providerConfig.headers)).toBe(false);
+  });
+
+  test("replacement requests are rebound to the settled turn termination scope", () => {
+    const source = readFileSync(repoPath("src/server/responses/core.ts"), "utf8");
+    const start = source.indexOf("parsed = await applyRequestTransforms({");
+    const end = source.indexOf("const toolBridgeMaps =", start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    expect(source.slice(start, end)).toContain("bindTurnTerminationScope(parsed, resolvedConversationId)");
+  });
+
+  test("editing a large continuation preserves every other native row and its metadata", () => {
+    const rows = Array.from({ length: 1000 }, (_, index) => [
+      { role: "user", content: `question ${index}`, vendor_id: `user-${index}` },
+      { role: "assistant", content: [{ type: "output_text", text: `answer ${index}`, annotations: [{ type: "fixture", index }] }], vendor_id: `assistant-${index}` },
+    ]).flat();
+    const body = { model: "model", input: rows, previous_response_id: "resp_history" };
+    const parsed = parseRequest(body);
+    const before = structuredClone(parsed);
+    parsed.context.messages[0]!.content = "edited question";
+    syncTransformedResponsesBody(before, parsed);
+    expect(parsed._rawBody).toEqual({ ...body, input: [{ ...rows[0], content: "edited question" }, ...rows.slice(1)] });
+    expect(body.input).toEqual(rows);
+    expect(body.input[0]!.content).toBe("question 0");
   });
 
   test("no-op transforms leave native input and catalog untouched", () => {
@@ -245,7 +369,7 @@ describe("requestTransforms", () => {
     expect(result._requestTransformsApplied).toBe(true);
     expect(result.context.messages.length).toBe(2);
     expect((result.context.messages[0] as any).content).toContain("transformed-by-t1 (google-antigravity:gemini-3.1-pro)");
-    expect((result.context.messages[1] as any).content).toContain("transformed-by-t2");
+    expect((result.context.messages[1] as any).content).toBe("transformed-by-t2 (acceptsImage:true)");
 
     // Running again does not duplicate executions (single run per turn)
     await applyRequestTransforms({
@@ -343,16 +467,17 @@ describe("requestTransforms", () => {
     }
   });
 
-  test("providerManagementConfigError validates canonical openai with requestTransforms", () => {
+  test("providerManagementConfigError rejects executable transform configuration even for canonical openai", () => {
     const entry = getProviderRegistryEntry("openai");
     if (!entry) return;
     const seed = providerConfigSeed(entry);
 
     const validCandidate = { ...seed, codexAccountMode: "pool" as const, requestTransforms: ["./custom.ts"] };
-    expect(providerManagementConfigError("openai", validCandidate)).toBeNull();
+    expect(providerManagementConfigError("openai", validCandidate))
+      .toBe("requestTransforms may only be configured in the local config file");
 
     const invalidCandidate = { ...seed, codexAccountMode: "pool" as const, requestTransforms: [""] };
     expect(providerManagementConfigError("openai", invalidCandidate))
-      .toBe("provider openai requestTransforms.0 must be a nonblank string");
+      .toBe("requestTransforms may only be configured in the local config file");
   });
 });
